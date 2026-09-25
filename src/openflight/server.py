@@ -39,10 +39,17 @@ from .ops243 import (
     SpeedReading,
     set_show_raw_readings,
 )
+from .phone_orientation import (
+    PhoneOrientationMeasurement,
+    PhoneOrientationValidationError,
+    load_phone_orientation_calibration,
+    save_phone_orientation_calibration,
+)
 from .power import SUPPORTED_BATTERY_PROVIDERS, PowerMonitor, PowerStatus
 from .profiles import ProfileStore
 from .rolling_buffer.monitor import estimate_carry_with_spin, get_optimal_spin_for_ball_speed
 from .session_logger import get_session_logger, init_session_logger, log_session_error
+from .shot_stream import SSE_MIMETYPE, ShotStreamBroker, ShotStreamFull
 from .sim import (
     IncompleteShotError,
     PlayerState as SimPlayerState,
@@ -135,6 +142,10 @@ camera_capture_config: dict = {"enabled": False}
 camera_replay_manager = None
 camera_reference_ball_tracker = None
 camera_ball_flight_reference_tracker = None
+PHONE_ORIENTATION_CALIBRATION_PATH = (
+    Path.home() / ".config" / "openflight" / "iwr6843_phone_orientation.json"
+)
+_iwr6843_calibration_lock = threading.Lock()
 
 # Optional LIS3DH enclosure orientation used to compensate TI mount tilt.
 inclinometer_service = None
@@ -156,6 +167,20 @@ sim_connectors: List = []
 # *seconds* (see initial_shot_counter): epoch millis overflow GSPro's 32-bit
 # ShotNumber field and every shot comes back 501 "Bad format".
 sim_player_state = SimPlayerState(shot_counter=initial_shot_counter())
+
+# Optional Bluetooth Low Energy publisher for the iOS app.
+ble_publisher = None
+
+# One Pi-owned selection is shared by the browser UI and every phone/tablet.
+# Monitors start on driver, and successful changes update this value atomically
+# before being fanned out over all enabled transports.
+active_club = ClubType.DRIVER
+club_selection_lock = threading.Lock()
+
+# Wi-Fi shot delivery for the iOS app. Always available: it exposes the same
+# shots the browser UI already broadcasts over WebSocket, so it adds no reach
+# beyond the existing HTTP server.
+shot_stream = ShotStreamBroker()
 
 shutdown_lock = threading.Lock()
 shutdown_cleanup_started = False
@@ -420,6 +445,8 @@ def _cleanup_hardware_for_shutdown() -> bool:
         _run_shutdown_step("battery monitor stop", power_monitor.stop)
     if camera_capture_runtime:
         _run_shutdown_step("camera capture stop", camera_capture_runtime.stop)
+    if ble_publisher:
+        _run_shutdown_step("BLE publisher stop", ble_publisher.stop)
 
     _run_shutdown_step("launch monitor stop", stop_monitor)
 
@@ -957,6 +984,187 @@ def display():
     return send_from_directory(_react_app_dir(), "index.html")
 
 
+@app.route("/api/calibration/iwr6843/orientation", methods=["GET", "POST"])
+def api_iwr6843_orientation_calibration():
+    """Read or apply a gravity-referenced phone measurement to TI mount tilt."""
+    if iwr6843_runtime is None:
+        return {"error": "TI IWR6843 radar is not enabled"}, 409
+
+    if request.method == "GET":
+        return {
+            "status": "ready",
+            "configured_iwr_tilt_deg": round(math.degrees(iwr6843_runtime.calibration.tilt_rad), 4),
+            "azimuth_offset_deg": round(iwr6843_runtime.azimuth_offset_deg, 4),
+            "calibration": iwr6843_runtime_config.get("phone_orientation_calibration"),
+        }
+
+    return apply_iwr6843_orientation_calibration(request.get_json(silent=True))
+
+
+def apply_iwr6843_orientation_calibration(payload):
+    """Validate, persist, and activate one phone orientation measurement."""
+    if iwr6843_runtime is None:
+        return {"error": "TI IWR6843 radar is not enabled"}, 409
+
+    try:
+        measurement = PhoneOrientationMeasurement.from_payload(payload)
+    except PhoneOrientationValidationError as error:
+        return {"error": str(error)}, 400
+
+    enclosure_pitch_deg = None
+    if inclinometer_service is not None:
+        try:
+            selection = inclinometer_service.wait_for_stable(timeout_s=2.0)
+        except Exception as error:  # pylint: disable=broad-exception-caught
+            logger.warning("[SERVER] Enclosure sensor failed during phone calibration: %s", error)
+            return {"error": "Could not read the enclosure sensor; try again"}, 409
+        if selection.snapshot is None:
+            return {
+                "error": (
+                    "The enclosure sensor is not stable "
+                    f"({selection.status}); keep the rig still and try again"
+                )
+            }, 409
+        enclosure_pitch_deg = float(selection.snapshot.calibrated_pitch_deg)
+
+    configured_tilt_deg = measurement.mount_tilt_deg - (enclosure_pitch_deg or 0.0)
+    if not -45.0 <= configured_tilt_deg <= 45.0:
+        return {"error": "Derived TI-to-enclosure tilt is outside the supported range"}, 400
+
+    record = {
+        "schema_version": 1,
+        "source": "ios_companion",
+        "configured_iwr_tilt_deg": configured_tilt_deg,
+        "enclosure_pitch_deg": enclosure_pitch_deg,
+        "azimuth_offset_deg": iwr6843_runtime.azimuth_offset_deg,
+        "measurement": measurement.to_dict(),
+        "applied_at": datetime.now().astimezone().isoformat(),
+    }
+
+    try:
+        with _iwr6843_calibration_lock:
+            save_phone_orientation_calibration(record, PHONE_ORIENTATION_CALIBRATION_PATH)
+            calibration_meta = dict(iwr6843_runtime.calibration.meta)
+            calibration_meta["phone_orientation_calibration"] = record
+            iwr6843_runtime.calibration = replace(
+                iwr6843_runtime.calibration,
+                tilt_rad=math.radians(configured_tilt_deg),
+                meta=calibration_meta,
+            )
+            iwr6843_runtime_config.update(
+                {
+                    "tilt_deg": configured_tilt_deg,
+                    "tilt_source": "ios_companion",
+                    "phone_orientation_calibration": record,
+                }
+            )
+    except OSError as error:
+        logger.warning("[SERVER] Failed to persist phone orientation: %s", error, exc_info=True)
+        return {"error": "OpenFlight could not save the calibration"}, 500
+
+    session_logger = get_session_logger()
+    if session_logger:
+        session_logger.log_config_change(
+            {"iwr6843": dict(iwr6843_runtime_config)},
+            source="ios_companion",
+        )
+    response = {
+        "status": "applied",
+        "persistent": True,
+        "measured_mount_tilt_deg": measurement.mount_tilt_deg,
+        "enclosure_pitch_deg": enclosure_pitch_deg,
+        "configured_iwr_tilt_deg": configured_tilt_deg,
+        "roll_deg": measurement.roll_deg,
+        "azimuth_offset_deg": iwr6843_runtime.azimuth_offset_deg,
+    }
+    socketio.emit("iwr6843_orientation_calibrated", response)
+    logger.info(
+        "[SERVER] Applied iOS phone calibration: measured tilt %.3fdeg, "
+        "enclosure pitch %s, configured TI tilt %.3fdeg",
+        measurement.mount_tilt_deg,
+        f"{enclosure_pitch_deg:.3f}deg" if enclosure_pitch_deg is not None else "not enabled",
+        configured_tilt_deg,
+    )
+    return response, 200
+
+
+def apply_club_selection(payload):
+    """Set the club used to tag and process future shots."""
+    global active_club  # pylint: disable=global-statement
+    if not isinstance(payload, dict):
+        return {"error": "Club selection must be a JSON object"}, 400
+    club_name = payload.get("club")
+    try:
+        club = ClubType(club_name)
+    except (TypeError, ValueError):
+        valid = ", ".join(item.value for item in ClubType if item is not ClubType.UNKNOWN)
+        return {"error": f"Unknown club; choose one of: {valid}"}, 400
+    if club is ClubType.UNKNOWN:
+        return {"error": "Unknown is not a selectable club"}, 400
+
+    with club_selection_lock:
+        # Without a monitor (startup, or tests) the selection is still recorded
+        # and broadcast, as the Socket.IO handler always did; the monitor picks
+        # up later changes once it exists.
+        if monitor is not None:
+            try:
+                monitor.set_club(club)
+            except Exception:  # pylint: disable=broad-exception-caught
+                logger.exception("[SERVER] Failed to set club to %s", club.value)
+                return {"error": "OpenFlight could not change the club"}, 500
+        active_club = club
+        response = {"status": "applied", "club": club.value}
+        _broadcast_club_selection(club)
+    logger.info("[SERVER] Club changed to %s", club.value)
+    return response, 200
+
+
+def current_club_selection(_payload=None):
+    """Return the Pi-owned club without changing monitor state."""
+    with club_selection_lock:
+        club_value = active_club.value
+    return {"status": "current", "club": club_value}, 200
+
+
+def _broadcast_club_selection(club: ClubType) -> None:
+    """Fan one authoritative club update out over every active transport."""
+    club_data = {"club": club.value}
+    try:
+        socketio.emit("club_changed", club_data)
+    except Exception:  # pylint: disable=broad-exception-caught
+        logger.warning("[SERVER] Failed to broadcast club over WebSocket", exc_info=True)
+    try:
+        shot_stream.publish_club(club.value)
+    except Exception:  # pylint: disable=broad-exception-caught
+        logger.warning("[SERVER] Failed to broadcast club over Wi-Fi stream", exc_info=True)
+    if ble_publisher is not None:
+        try:
+            ble_publisher.publish_club(club.value)
+        except Exception:  # pylint: disable=broad-exception-caught
+            logger.warning("[SERVER] Failed to broadcast club over BLE", exc_info=True)
+
+
+def dispatch_phone_control_command(command_type, payload):
+    """Route a versioned BLE phone command to the shared server operation."""
+    handlers = {
+        "iwr6843_orientation_calibration": apply_iwr6843_orientation_calibration,
+        "set_club": apply_club_selection,
+        "get_club": current_club_selection,
+    }
+    handler = handlers.get(command_type)
+    if handler is None:
+        return {"error": f"Unsupported phone command: {command_type}"}, 400
+    return handler(payload)
+
+
+@app.route("/api/club", methods=["GET", "POST"])
+def api_club_selection():
+    """Read or set the active club over Wi-Fi."""
+    if request.method == "GET":
+        return current_club_selection()
+    return apply_club_selection(request.get_json(silent=True))
+
+
 @app.route("/<path:path>")
 def static_files(path):
     """Serve static files."""
@@ -1078,6 +1286,24 @@ def init_camera_capture(
         return False
 
 
+def _resolve_iwr_mount_tilt(
+    calibration_tilt_deg: float,
+    *,
+    explicit_tilt_deg: float | None,
+) -> tuple[float, str]:
+    """Resolve TI tilt with explicit CLI values taking highest precedence."""
+    if explicit_tilt_deg is not None:
+        return float(explicit_tilt_deg), "command_line"
+    try:
+        saved = load_phone_orientation_calibration(PHONE_ORIENTATION_CALIBRATION_PATH)
+    except (OSError, json.JSONDecodeError, PhoneOrientationValidationError) as error:
+        logger.warning("[SERVER] Ignoring invalid saved phone calibration: %s", error)
+        return float(calibration_tilt_deg), "calibration_file"
+    if saved is not None:
+        return float(saved["configured_iwr_tilt_deg"]), "ios_companion"
+    return float(calibration_tilt_deg), "calibration_file"
+
+
 def init_iwr6843(
     *,
     port: str | None,
@@ -1114,8 +1340,11 @@ def init_iwr6843(
         calibration = Calibration.load(calibration_path)
         calibration.tee_range_m = tee_range_m
         calibration.tee_ball_height_m = ball_height_m
-        if tilt_deg is not None:
-            calibration.tilt_rad = math.radians(tilt_deg)
+        resolved_tilt_deg, tilt_source = _resolve_iwr_mount_tilt(
+            math.degrees(calibration.tilt_rad),
+            explicit_tilt_deg=tilt_deg,
+        )
+        calibration.tilt_rad = math.radians(resolved_tilt_deg)
         if radar_height_m is not None:
             calibration.meta["radar_height_m"] = radar_height_m
 
@@ -1159,6 +1388,7 @@ def init_iwr6843(
             "tx_order": resolved_order,
             "tdm_sign_policy": iwr6843_runtime.tdm_sign_policy,
             "tilt_deg": math.degrees(calibration.tilt_rad),
+            "tilt_source": tilt_source,
             "radar_height_m": calibration.radar_height_m,
             "ball_height_m": calibration.tee_ball_height_m,
             "azimuth_offset_deg": azimuth_offset_deg,
@@ -1469,6 +1699,24 @@ def _camera_capture_settings_payload() -> dict:
 def handle_get_camera_capture_settings():
     """Send current high-speed capture settings to the requesting UI."""
     socketio.emit("camera_capture_settings", _camera_capture_settings_payload())
+
+
+@app.route("/api/shots/stream")
+def shots_stream():
+    """Stream completed shots to the iOS app as Server-Sent Events."""
+    try:
+        subscriber = shot_stream.subscribe()
+    except ShotStreamFull as exc:
+        logger.warning("[SERVER] Refused shot stream client: %s", exc)
+        return str(exc), 503
+
+    response = Response(shot_stream.frames(subscriber), mimetype=SSE_MIMETYPE)
+    response.headers["Cache-Control"] = "no-cache"
+    response.headers["X-Accel-Buffering"] = "no"
+    # Covers the case where the response is discarded without ever being
+    # iterated; unsubscribing twice is a no-op.
+    response.call_on_close(lambda: shot_stream.unsubscribe(subscriber))
+    return response
 
 
 @socketio.on("set_camera_capture_settings")
@@ -1782,6 +2030,7 @@ def handle_connect():
     _emit_profiles()
     if power_monitor and power_monitor.status:
         socketio.emit("power_status", power_monitor.status.to_dict())
+    socketio.emit("club_changed", {"club": active_club.value})
     if monitor:
         socketio.emit("session_state", _session_state_payload(include_runtime_meta=True))
         socketio.emit("trigger_status", _get_trigger_status())
@@ -1802,14 +2051,7 @@ def handle_get_trigger_status():
 @socketio.on("set_club")
 def handle_set_club(data):
     """Handle club selection change."""
-    club_name = data.get("club", "driver")
-    try:
-        club = ClubType(club_name)
-        if monitor:
-            monitor.set_club(club)
-        socketio.emit("club_changed", {"club": club.value})
-    except ValueError:
-        pass
+    apply_club_selection(data)
 
 
 def _payload_dict(data) -> dict:
@@ -2223,6 +2465,7 @@ def _sim_on_status(target: str, event) -> None:
 
 def _sim_on_inbound(target: str, event) -> None:
     """Apply an inbound simulator event (player/club update, error, ack)."""
+    global active_club  # pylint: disable=global-statement
     if isinstance(event, PlayerUpdate):
         sim_player_state.apply(event)
         club_value = sim_player_state.club.value
@@ -2236,12 +2479,17 @@ def _sim_on_inbound(target: str, event) -> None:
             sl.log_sim_player(target=target, handed=sim_player_state.handed, club=club_value)
         # The monitor owns current-club state for shot tagging and carry/spin
         # model selection; keep it in sync with the sim's canonical club.
-        if monitor is not None:
-            try:
-                monitor.set_club(sim_player_state.club)
-            except Exception:  # pylint: disable=broad-except
-                logger.exception("[sim] monitor.set_club failed")
-        socketio.emit("club_changed", {"club": club_value})
+        with club_selection_lock:
+            monitor_updated = True
+            if monitor is not None:
+                try:
+                    monitor.set_club(sim_player_state.club)
+                except Exception:  # pylint: disable=broad-except
+                    logger.exception("[sim] monitor.set_club failed")
+                    monitor_updated = False
+            if monitor_updated:
+                active_club = sim_player_state.club
+                _broadcast_club_selection(active_club)
     elif isinstance(event, SimError):
         logger.warning("[sim] ← %s error: %s", target, event.message)
         socketio.emit("sim_status", {"target": target, "state": "error", "message": event.message})
@@ -3254,6 +3502,7 @@ def _finalize_shot_detected(
         )
 
     # Emit shot with launch angle data included
+    shot_data = None
     try:
         shot_data = shot_to_dict(shot)
         stats = monitor.get_session_stats() if monitor else {}
@@ -3277,7 +3526,21 @@ def _finalize_shot_detected(
             context={"stage": f"emit_{emit_event}", "ball_speed_mph": shot.ball_speed_mph},
             exc=e,
         )
-        return
+
+    # Bluetooth transport is deliberately independent of WebSocket delivery.
+    if shot_data is not None and ble_publisher is not None:
+        try:
+            ble_publisher.publish(shot_data)
+        except Exception as e:  # pylint: disable=broad-exception-caught
+            logger.warning("[SERVER] Failed to queue BLE shot: %s", e, exc_info=True)
+
+    # Wi-Fi transport is likewise independent; a stalled client cannot affect
+    # shot recording or the browser UI.
+    if shot_data is not None:
+        try:
+            shot_stream.publish(shot_data)
+        except Exception as e:  # pylint: disable=broad-exception-caught
+            logger.warning("[SERVER] Failed to queue streamed shot: %s", e, exc_info=True)
 
     # Forward to simulator connectors (optional)
     _forward_shot_to_simulators(shot)
@@ -4378,6 +4641,11 @@ def main():
     )
     _add_ballistics_arguments(parser)
     parser.add_argument(
+        "--ble",
+        action="store_true",
+        help="Advertise completed shots over Bluetooth LE for the OpenFlight iOS app",
+    )
+    parser.add_argument(
         "--trigger",
         choices=["sound", "speed"],
         default="sound",
@@ -4975,6 +5243,14 @@ def main():
         start_power_monitor(battery_provider)
         print(f"Battery monitoring: ENABLED ({battery_provider})")
         startup_status.ready("battery", "Power monitor ready")
+
+    global ble_publisher  # pylint: disable=global-statement
+    if args.ble:
+        from .ble import BleShotPublisher  # pylint: disable=import-outside-toplevel
+
+        ble_publisher = BleShotPublisher(command_handler=dispatch_phone_control_command)
+        ble_publisher.start()
+        print("Bluetooth LE enabled (advertising as OpenFlight)")
 
     # Simulator connectors (off unless --sim). Started after the monitor exists
     # so inbound club updates can call monitor.set_club().
