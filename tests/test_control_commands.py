@@ -1,5 +1,7 @@
 """Tests for transport-independent phone control commands."""
 
+import pytest
+
 from openflight import server as server_module
 from openflight.launch_monitor import ClubType
 
@@ -19,6 +21,19 @@ class _ClubPublisher:
     def publish_club(self, club):
         self.clubs.append(club)
         return True
+
+
+@pytest.fixture(autouse=True)
+def _isolate_club_state(monkeypatch):
+    """Keep club changes and their broadcasts from leaking into other tests.
+
+    ``apply_club_selection`` writes the module-global ``active_club`` and fans
+    out over Socket.IO, the SSE broker and BLE, so every test gets its own.
+    """
+    monkeypatch.setattr(server_module, "active_club", ClubType.DRIVER)
+    monkeypatch.setattr(server_module, "shot_stream", _ClubPublisher())
+    monkeypatch.setattr(server_module, "ble_publisher", None)
+    monkeypatch.setattr(server_module.socketio, "emit", lambda *_args, **_kwargs: None)
 
 
 def test_apply_club_selection_updates_monitor_and_broadcasts(monkeypatch):
