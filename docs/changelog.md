@@ -59,6 +59,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   when Node is older than 22.12 or `npm install` fails and `ui/dist` already
   exists). Installing Electron needs **Node.js 22.12 or newer**. See
   [Electron Kiosk Shell](electron-kiosk-shell.md).
+- **Phone transports: Bluetooth LE, a Wi-Fi shot stream and a club API.**
+  Ported from [jake-fishtech](https://github.com/jake-fishtech)'s `feat/iOS-ble`
+  branch. `--ble` (with the optional `ble` extra, `bless==0.3.0` on Linux)
+  advertises a GATT service that notifies each final shot and accepts versioned
+  phone commands (`set_club`, `get_club`, IWR6843 orientation). Without BlueZ or
+  the extra, `--ble` logs that Bluetooth is unavailable and the server carries
+  on. `GET /api/shots/stream` sends the same final shots and `club_changed` as
+  Server-Sent Events, replaying the latest shot on connect and sending a
+  keep-alive `: ping`. `GET`/`POST /api/club` reads or sets the Pi-owned club,
+  and every club change (kiosk, phone, simulator) is broadcast over Socket.IO,
+  SSE and BLE. `POST /api/calibration/iwr6843/orientation` applies a
+  gravity-referenced phone measurement as the IWR6843 mount tilt and persists it
+  to `~/.config/openflight/iwr6843_phone_orientation.json`; an explicit
+  `--iwr6843-tilt-deg` still wins. `start-kiosk.sh --ble` syncs the `ble` extra
+  and `setup.sh` installs it. Wire format: [iOS BLE](ios-ble.md). Behaviour
+  changes: Socket.IO `set_club` now ignores `unknown` and a missing club (it used
+  to fall back to driver), and a failed Socket.IO shot emit no longer stops BLE,
+  SSE and simulator delivery.
 - **PAR-TEE connector.** `"type": "partee"` in `config/sim.json` streams shots
   to the [PAR-TEE](https://playpartee.com) iPhone app over OpenConnect V1 on the
   phone's Wi-Fi address (port 921 by default). Same shared codec as GSPro and
