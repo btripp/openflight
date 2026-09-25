@@ -77,6 +77,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   changes: Socket.IO `set_club` now ignores `unknown` and a missing club (it used
   to fall back to driver), and a failed Socket.IO shot emit no longer stops BLE,
   SSE and simulator delivery.
+- **BLE and Wi-Fi schema v2 for phone apps.** Version-one traffic is unchanged
+  byte for byte, so jake-fishtech's iOS app keeps working. v2 lives on a second
+  shot/control characteristic pair in the same GATT service (BlueZ cannot notify
+  one central but not another on a shared characteristic; see the design note in
+  [phone app connection](ios-ble.md#schema-v2-design-decision)). A `hello`
+  command negotiates it on either control characteristic. v2 shots add
+  `shot_number`, profile, `carry_range`, `spin_source`,
+  `launch_angle_confidence`, `final` and `enrichment`, and hardware-enriched
+  shots now arrive twice, provisional then final, with one `event_id`. v2 phones
+  also get `shot_processing`, `profiles`, `power_status`, `session_cleared` and
+  `club_changed` events and can `get_profiles`, `set_active_profile`,
+  `get_power_status`, `clear_session` and `delete_shot` through the same server
+  functions Socket.IO uses. `GET /api/shots/stream?schema=2` opts SSE clients
+  into the same events. BLE delivery now follows per-characteristic
+  subscriptions, so the latest shot is replayed when a shot characteristic is
+  subscribed and one phone unsubscribing no longer pauses the others. Tests run
+  the real publisher against a loopback fake of Bless/BlueZ, and
+  `tests/fixtures/ble_goldens/` holds framed hex goldens for client test suites
+  (`scripts/ble/generate_goldens.py`).
 - **PAR-TEE connector.** `"type": "partee"` in `config/sim.json` streams shots
   to the [PAR-TEE](https://playpartee.com) iPhone app over OpenConnect V1 on the
   phone's Wi-Fi address (port 921 by default). Same shared codec as GSPro and

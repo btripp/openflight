@@ -1,4 +1,4 @@
-# iOS app connection
+# Phone app connection (Bluetooth LE and Wi-Fi)
 
 > **BLE blocker — check the Raspberry Pi kernel first:** Raspberry Pi kernel
 > `6.18.34+rpt-rpi-2712` has a confirmed regression that rejects every BLE
@@ -6,10 +6,16 @@
 > Wi-Fi transport or boot a working kernel such as 6.12.x; there is no userspace
 > workaround. See the [full diagnosis](#known-bad-raspberry-pi-kernel-61834rpt-rpi-2712).
 
-OpenFlight sends each completed shot from a Raspberry Pi to the included SwiftUI
-app over one of two local transports, chosen with the picker at the top of the
-app. Both carry the identical versioned payload described below, so the app
-behaves the same either way.
+OpenFlight sends each completed shot from a Raspberry Pi to a phone app over one
+of two local transports. Both carry the identical versioned payload described
+below, so an app behaves the same either way. Two apps speak this protocol:
+
+- jake-fishtech's SwiftUI app, on the
+  [`feat/iOS-ble` branch of his fork](https://github.com/jake-fishtech/openflight/tree/feat/iOS-ble/ios)
+  (schema version 1).
+- The Kotlin Multiplatform companion for Android and iOS,
+  [`btripp/openflight-mobile-kmp`](https://github.com/btripp/openflight-mobile-kmp)
+  (schema version 1, and [schema v2](#schema-v2) where the Pi offers it).
 
 | Transport | Pi setup | Use it when |
 |---|---|---|
@@ -26,8 +32,7 @@ browser UI, and exposes nothing the browser UI does not already broadcast.
 - Mac with Xcode 16 or newer to build the app
 - The normal OpenFlight radar setup
 
-The app uses only Apple frameworks and has no package dependencies. The Pi
-uses [Bless](https://github.com/kevincar/bless) to expose a small GATT server
+The Pi uses [Bless](https://github.com/kevincar/bless) to expose a small GATT server
 through BlueZ.
 
 ## Run the Pi
@@ -82,10 +87,11 @@ beyond that, so a forgotten `curl` cannot crowd out a phone.
 
 ## Build and run the iOS app
 
-For complete Xcode, signing, physical-device, simulator, testing, and
-troubleshooting instructions, start with [`ios/README.md`](../ios/README.md).
+The SwiftUI app is not part of this repository. For complete Xcode, signing,
+physical-device, simulator, testing, and troubleshooting instructions, see
+[`ios/README.md` in jake-fishtech's fork](https://github.com/jake-fishtech/openflight/blob/feat/iOS-ble/ios/README.md).
 
-1. Open `ios/OpenFlight.xcodeproj` in Xcode.
+1. In a checkout of that branch, open `ios/OpenFlight.xcodeproj` in Xcode.
 2. Select the `OpenFlight` target, choose your development team, and use a
    unique bundle identifier if Xcode requests one.
 3. Connect an iPhone, select it as the run destination, and press Run.
@@ -194,15 +200,233 @@ has a five-byte, big-endian header followed by up to 15 payload bytes:
 
 Consumers should group frames by sequence, ignore duplicate fragment indexes,
 order fragments by index, and decode only after all fragments arrive. The
-shared contract fixture is
-`ios/OpenFlightTests/Fixtures/shot_v1.json`; both Python and Swift tests decode
-that file.
+shared contract fixture is `tests/fixtures/shot_v1.json` in this repository;
+the Python tests and the app tests decode that file. Framed byte-level goldens
+for every message type live in `tests/fixtures/ble_goldens/` (see
+[Testing without hardware](#testing-without-hardware)).
 
 Control writes and responses use the same framing. A command contains
 `schema_version`, a unique `request_id`, a `type`, and a JSON `payload`. The Pi
 notifies a response with the matching `request_id`, `ok`, and either `result` or
-`error`. Version one supports `set_club` and
-`iwr6843_orientation_calibration`.
+`error`:
+
+```json
+{"payload":{"club":"7-iron"},"request_id":"9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d","schema_version":1,"type":"set_club"}
+{"ok":true,"request_id":"9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d","result":{"club":"7-iron","status":"applied"},"schema_version":1}
+```
+
+Responses and unsolicited events share the control characteristic, so match
+responses by `request_id` and treat messages with a `type` as events. Version
+one supports these commands:
+
+| Command | Payload | Result |
+|---|---|---|
+| `set_club` | `{"club":"7-iron"}` | `{"status":"applied","club":"7-iron"}` |
+| `get_club` | `{}` | `{"status":"current","club":"7-iron"}`: the Pi-owned club, unchanged |
+| `iwr6843_orientation_calibration` | phone gravity measurement | `status, persistent, measured_mount_tilt_deg, enclosure_pitch_deg, configured_iwr_tilt_deg, roll_deg, azimuth_offset_deg` |
+| `hello` | `{"client_schema_max":2}` | negotiation, see [schema v2](#schema-v2) |
+
+Every club change, from any client, is notified on the control characteristic
+as `{"club":"7-iron","schema_version":1,"type":"club_changed"}`. Unknown
+commands fail with `"error":"Unsupported phone command: <type>"`.
+
+## Schema v2
+
+Schema v2 adds what the browser UI already gets over Socket.IO: profiles, shot
+numbering, the shot-processing state, battery status, and provisional shots
+that are replaced by their final version. Version one stays exactly as it was,
+byte for byte, so the version-one iOS app (whose decoder rejects any
+`schema_version` other than `1`) keeps working next to a v2 phone.
+
+### Schema v2 design decision
+
+*Status: accepted for review, 2026-09-25.*
+
+**Question.** Can the Pi send v2 notifications only to centrals that negotiated
+v2, on the existing characteristics?
+
+**Finding.** No, not with Bless 0.3.0 on BlueZ, and not with BlueZ's GATT D-Bus
+API at all:
+
+- A notification is a write of the characteristic's `Value` property
+  (`BlessServerBlueZDBus.update_value` sets `gatt.Value`, which emits
+  `PropertiesChanged`). `bluetoothd` then notifies **every** central whose CCCD
+  is enabled on that characteristic. The D-Bus API has no per-device notify.
+- Bless drops the `options` argument of `WriteValue`, which is where BlueZ puts
+  the writing device's object path, so the server cannot even tell which
+  central sent `hello`.
+- `StartNotify`/`StopNotify` carry no device either. BlueZ calls them once per
+  characteristic (first subscriber in, last subscriber out).
+
+CoreBluetooth could target centrals (`updateValue:forCharacteristic:onSubscribedCentrals:`),
+but Bless passes `nil` (all centrals), and macOS is not a deployment target.
+
+**Decision.** Schema v2 gets its own shot and control characteristics in the
+same service. A v1 central never subscribes to them, so BlueZ never delivers a
+v2 frame to it, and the v1 characteristics carry exactly the v1 traffic they
+always did. `hello` works on both control characteristics, so a client can
+negotiate before it commits to a pair, and an older Pi answers it with
+`Unsupported phone command: hello`.
+
+**Consequences.**
+
+- One GATT service now has four characteristics. Discovery of the v2 pair is
+  itself a capability signal.
+- A final shot is sent twice over the air when a v1 and a v2 phone are
+  connected at once (once per pair). The Pi's radio time is not the bottleneck
+  at golf-shot rates.
+- A v2 phone that subscribes to both pairs gets both copies; clients subscribe
+  to one pair only.
+- Per-characteristic subscription state now drives delivery. The publisher
+  reads Bless's `app.subscribed_characteristics` after each `StartNotify` /
+  `StopNotify`, so v2 frames are only pushed while a v2 central is subscribed
+  and a v2 phone unsubscribing no longer stops v1 delivery.
+
+**Rejected.**
+
+- *Per-central state on shared characteristics:* impossible here (above).
+- *A v2 flag inside v1 messages:* the v1 decoder rejects unknown
+  `schema_version` values, and new fields would still reach v1 phones.
+- *A second GATT service:* works, but an extra service UUID in the
+  advertisement costs scarce advertising bytes and buys nothing over two more
+  characteristics.
+
+### Characteristics
+
+| Attribute | UUID | Properties |
+|---|---|---|
+| Shot notification, v2 | `ED365FE6-3ABF-4FC3-8E44-D9525A22DABD` | notify |
+| Control, v2 | `7BA96E63-12C2-4CE0-BB84-3513C7FD1474` | write with response, notify |
+
+Both live in the same service, `B6F633F2-E6E3-45AE-84B4-968ECCA2D9C7`, and use
+the same 20-byte framing as version one. Sequence numbers are counted
+separately per characteristic.
+
+**Encoding.** v2 messages are compact JSON with sorted keys, like version one,
+but text is **UTF-8** instead of `\uXXXX` escapes (that is what lets twelve
+40-character profile names fit in one message). A fragment boundary can split a
+multi-byte character, so decode UTF-8 only after reassembling the whole
+message.
+
+### Negotiation
+
+1. Discover the service. If the v2 characteristics are missing, the Pi is
+   version one: use the v1 pair.
+2. Subscribe to the v2 control characteristic and write `hello`:
+   ```json
+   {"payload":{"client_schema_max":2},"request_id":"<uuid>","schema_version":2,"type":"hello"}
+   ```
+   The result names the negotiated schema, the features and the v2 pair:
+   ```json
+   {"ok":true,"request_id":"<uuid>","result":{"characteristics":{"control":"7BA96E63-12C2-4CE0-BB84-3513C7FD1474","shot":"ED365FE6-3ABF-4FC3-8E44-D9525A22DABD"},"features":["provisional_shots","shot_processing","profiles","power_status","session_clear","delete_shot","club"],"schema_version":2},"schema_version":2}
+   ```
+3. Subscribe to the v2 shot characteristic. The latest v2 shot is replayed.
+4. Ask for state: `get_club`, `get_profiles` and, if wanted, `get_power_status`.
+
+`hello` also works on the v1 control characteristic, in a v1 envelope
+(`"schema_version":1`); the response envelope is then v1 while the `result` is
+the same. An older Pi answers `ok:false` with
+`Unsupported phone command: hello`. Treat that, or no answer within 10 seconds,
+as version one. `client_schema_max: 1` returns `{"schema_version":1,"features":[]}`.
+The v2 control characteristic accepts envelopes with `schema_version` 1 or 2
+and always answers with `schema_version: 2`.
+
+### v2 shot
+
+Sent on the v2 shot characteristic. It carries every version-one field, plus:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `type` | `"shot"` | |
+| `final` | bool | `false`: OPS-only provisional shot, sent while optional hardware (IWR6843, camera) is still working. `true`: the final shot |
+| `event_id` | UUID string | Stable per shot: the provisional and final versions of one shot share it. **Upsert by `event_id`** |
+| `shot_number` | int or null | Per-monitor-run sequence; not reused after a delete |
+| `profile_id`, `profile_name` | string or null | Profile the shot was attributed to at detection |
+| `carry_range` | `[low, high]` or null | Carry range in yards |
+| `spin_source` | string or null | Where `spin_rpm` came from |
+| `launch_angle_confidence` | number or null | 0–1 |
+| `enrichment` | object or null | `{"status":"pending"}` on a provisional shot; `{"status":"complete"}` or `{"status":"skipped","reason":"deadline"|"capacity"|"queue_full"|"worker_unavailable"}` on a final shot that had a provisional; `null` when the shot never waited for optional hardware |
+
+Every key is always present; unknown values are `null`. A shot with no optional
+hardware configured is sent once, final. The provisional shot is not sent at all
+to v1 phones, which only ever receive final shots. The contract fixture is
+`tests/fixtures/shot_v2.json`, built from a real mock shot:
+
+```json
+{"ball_speed_mph":106.1,"carry_range":[144,160],"club":"7-iron","club_path_deg":2.5,"club_speed_mph":83.5,"enrichment":{"status":"complete"},"estimated_carry_yards":152,"event_id":"05dd37ec-49ed-596b-b1a4-953d54e4f239","final":true,"launch_angle_confidence":0.6,"launch_angle_horizontal":-0.7,"launch_angle_vertical":21.2,"profile_id":"0f8e4b2a9c7d4e1f8a6b3c5d7e9f1a2b","profile_name":"Zoë","schema_version":2,"shot_number":7,"smash_factor":1.27,"spin_axis_deg":-1.6,"spin_rpm":6482,"spin_source":null,"timestamp":"2026-09-25T14:03:07.412345","type":"shot"}
+```
+
+### v2 events
+
+Notified on the v2 control characteristic. Each has `schema_version: 2` and a
+`type`, and never a `request_id`:
+
+| `type` | Fields | When |
+|---|---|---|
+| `club_changed` | `club` | Any club change (kiosk, phone, simulator) |
+| `profiles` | `profiles: [{id, name}]`, `active_profile_id` | After every profile request or mutation from any client, including rejected ones |
+| `session_cleared` | `profile_id` | After any client clears a profile's shots |
+| `shot_processing` | `state`: `capturing`, `calculating` or `failed` | Rolling-buffer monitor progress; the next shot ends it |
+| `power_status` | the Socket.IO `power_status` payload: `available, provider, state, battery_percent, battery_voltage_v, external_power, updated_at, error` | Every 5 s with `--battery geekworm` |
+
+```json
+{"club":"7-iron","schema_version":2,"type":"club_changed"}
+{"active_profile_id":"0f8e…","profiles":[{"id":"0f8e…","name":"Zoë ⛳"},{"id":"7c1d…","name":"Sam"}],"schema_version":2,"type":"profiles"}
+{"profile_id":"0f8e…","schema_version":2,"type":"session_cleared"}
+{"schema_version":2,"state":"calculating","type":"shot_processing"}
+{"available":true,"battery_percent":76.5,"battery_voltage_v":3.98,"error":null,"external_power":false,"provider":"geekworm","schema_version":2,"state":"on_battery","type":"power_status","updated_at":"2026-09-25T14:03:05.000000+00:00"}
+```
+
+Profiles over BLE carry only `id` and `name`. `created_at` and the open-ended
+`settings` stay on Socket.IO, because the phone only selects profiles here and
+an unbounded `settings` object could not be guaranteed to fit in one message.
+
+### v2 commands
+
+Each v2 command calls the same server function as its Socket.IO counterpart, so
+the kiosk and every other client see the same broadcasts.
+
+| Command | Payload | Result | Also broadcasts |
+|---|---|---|---|
+| `hello` | `{"client_schema_max":2}` | see [Negotiation](#negotiation) | |
+| `get_club` | `{}` | `{"status":"current","club":…}` | |
+| `set_club` | `{"club":"7-iron"}` | `{"status":"applied","club":…}` | `club_changed` |
+| `iwr6843_orientation_calibration` | as version one | as version one | |
+| `get_profiles` | `{}` | `{"status":"sent"}` | `profiles`: the roster arrives as the event, not in the result |
+| `set_active_profile` | `{"profile_id":…}` | `{"status":"applied","active_profile_id":…}`, or `ok:false` `Unknown profile` | `profiles` (also when rejected) |
+| `get_power_status` | `{}` | the `power_status` payload, or `ok:false` `Battery monitoring is not enabled` / `No battery reading yet` | |
+| `clear_session` | `{"profile_id":…}` (default: active profile) | `{"status":"cleared","profile_id":…}` | `session_cleared` |
+| `delete_shot` | `{"timestamp":"<shot timestamp>"}` | `{"status":"deleted","timestamp":…}`, or `ok:false` `Shot not found` | Socket.IO `session_state` |
+
+Adding, renaming and removing profiles stay on Socket.IO and the kiosk. An event
+triggered by a command is normally notified before the command's response, but
+clients must accept either order. The Pi processes commands as they arrive and
+enforces no busy state or timeout of its own; clients own their timeouts.
+Version-one commands keep working on the v1 control characteristic, and v2-only
+commands sent there fail with `Unsupported phone command`.
+
+### Wi-Fi: `?schema=2`
+
+`GET /api/shots/stream?schema=2` opts a Server-Sent Events client into schema
+v2. The default (no parameter, or `schema=1`) is the unchanged version-one
+stream; any other value returns `400`. A v2 stream opens with `: ping`, then
+the current state as `club_changed`, `profiles` and (with a battery monitor)
+`power_status`, then the latest v2 shot. Event names match the `type` of the
+payload: `shot`, `shot_processing`, `profiles`, `power_status`,
+`session_cleared` and `club_changed`. Commands stay on `/api/club`, the
+calibration route and Socket.IO.
+
+```bash
+curl -N 'http://raspberrypi.local:8080/api/shots/stream?schema=2'
+```
+
+### Size budget
+
+A BLE message is at most 255 fragments × 15 bytes = 3,825 bytes. Tests encode
+a worst-case v2 shot (longest float representations everywhere, a 40-character
+profile name of six-byte escapes) and a `profiles` event with twelve such names
+(3,610 bytes) and require both to fit. The publisher refuses, and logs, any
+message that would not fit instead of sending a truncated one.
 
 ## Delivery behavior
 
@@ -214,6 +438,8 @@ notifies a response with the matching `request_id`, `ok`, and either `result` or
 - Disconnecting clears that client's queue but retains the latest completed shot
   for replay on the next connection.
 - The iOS app ignores a replayed event when its `event_id` is already visible.
+  v2 clients upsert by `event_id`, which also merges a provisional shot with
+  its final version.
 
 ## Security and scope
 
@@ -224,8 +450,52 @@ Wi-Fi API as accessible to anything on the same network — the same assumption
 the browser UI already makes. Phone-assisted calibration can update and persist
 TI mount tilt, so use either transport only in a trusted environment.
 
-Add authenticated pairing before expanding the control channel to sensitive or
-destructive operations.
+Schema v2 adds two destructive commands, `clear_session` and `delete_shot`,
+with the same exposure the browser UI's Socket.IO already has on the local
+network, but now also reachable by any nearby Bluetooth device. Authenticated
+pairing is still future work; until then enable `--ble` only where that is
+acceptable.
+
+## Testing without hardware
+
+Everything above the radio is covered by the normal test suite, with no Pi,
+Bluetooth adapter or `bless` install:
+
+- `tests/ble_harness.py` runs the real `BleShotPublisher` on its own thread and
+  event loop against a fake Bless server that behaves like Bless 0.3.0 on
+  BlueZ (subscription hooks called before `app.subscribed_characteristics`
+  changes, notifications delivered only to centrals subscribed to that
+  characteristic, writes through `write_request_func`). `VirtualCentral`s play
+  the phones: they subscribe, write framed commands and reassemble
+  notifications with the real reassembler.
+- `tests/test_ble_loopback.py` uses it end to end against the real server
+  dispatch: latest-shot replay, `hello` on both control characteristics, a
+  provisional-then-final shot (v2 phone gets both with one `event_id`, a v1
+  phone next to it gets only the v1 final shot), club and profile commands,
+  the calibration `409` path, unknown commands and pair-by-pair unsubscribe.
+- `tests/fixtures/ble_goldens/*.json` hold framed hex for every message type.
+  `server_to_client` files are generated by
+  `uv run python scripts/ble/generate_goldens.py` and checked by
+  `tests/test_ble_goldens.py`; client test suites decode them.
+  `client_to_server` files are the reverse: a client commits the frames its
+  own encoder produces (`name`, `characteristic`, `sequence`, `message`,
+  `payload_hex`, `frames_hex`, and an `expect` block with `ok`,
+  `schema_version` and expected `result` fields), and the Python tests
+  reassemble them, dispatch them through the loopback server and check the
+  answer.
+
+```bash
+uv run pytest tests/test_ble_protocol.py tests/test_ble_protocol_v2.py \
+  tests/test_ble_publisher.py tests/test_ble_loopback.py tests/test_ble_goldens.py \
+  tests/test_shot_stream.py tests/test_phone_transport_server.py \
+  tests/test_phone_transport_v2.py tests/test_control_commands.py -v
+uv run python scripts/ble/generate_goldens.py --check
+```
+
+What still needs a Pi and phones: BlueZ advertising, discovery and
+connection from iOS and Android, pairing and permission prompts, fragment
+pacing over a real link, reconnects after a Pi restart, background behaviour,
+and coexistence with Wi-Fi and Socket.IO clients.
 
 ## Troubleshooting
 
@@ -314,11 +584,11 @@ above: it needs no Bluetooth and delivers the identical payload.
 
 ## Automated tests
 
-```bash
-uv run pytest tests/test_ble_protocol.py tests/test_ble_publisher.py \
-  tests/test_shot_stream.py tests/test_phone_orientation_calibration.py \
-  tests/test_control_commands.py -v
+The Python side is covered in [Testing without hardware](#testing-without-hardware).
+The SwiftUI app's tests run from a checkout of jake-fishtech's `feat/iOS-ble`
+branch:
 
+```bash
 xcodebuild test \
   -project ios/OpenFlight.xcodeproj \
   -scheme OpenFlight \
