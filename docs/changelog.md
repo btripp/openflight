@@ -86,10 +86,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `shot_number`, profile, `carry_range`, `spin_source`,
   `launch_angle_confidence`, `final` and `enrichment`, and hardware-enriched
   shots now arrive twice, provisional then final, with one `event_id`. v2 phones
-  also get `shot_processing`, `profiles`, `power_status`, `session_cleared` and
-  `club_changed` events and can `get_profiles`, `set_active_profile`,
-  `get_power_status`, `clear_session` and `delete_shot` through the same server
-  functions Socket.IO uses. `GET /api/shots/stream?schema=2` opts SSE clients
+  also get `shot_processing`, `profiles`, `power_status`, `session_cleared`,
+  `shot_deleted` and `club_changed` events and can `get_profiles`,
+  `set_active_profile` and `get_power_status` through the same server functions
+  Socket.IO uses. Because BLE is unauthenticated, v2 over Bluetooth is
+  read-and-select only: clearing sessions, deleting shots and editing profiles
+  stay on Wi-Fi. `GET /api/shots/stream?schema=2` opts SSE clients
   into the same events. BLE delivery now follows per-characteristic
   subscriptions, so the latest shot is replayed when a shot characteristic is
   subscribed and one phone unsubscribing no longer pauses the others. Tests run

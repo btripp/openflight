@@ -318,7 +318,7 @@ message.
    ```
    The result names the negotiated schema, the features and the v2 pair:
    ```json
-   {"ok":true,"request_id":"<uuid>","result":{"characteristics":{"control":"7BA96E63-12C2-4CE0-BB84-3513C7FD1474","shot":"ED365FE6-3ABF-4FC3-8E44-D9525A22DABD"},"features":["provisional_shots","shot_processing","profiles","power_status","session_clear","delete_shot","club"],"schema_version":2},"schema_version":2}
+   {"ok":true,"request_id":"<uuid>","result":{"characteristics":{"control":"7BA96E63-12C2-4CE0-BB84-3513C7FD1474","shot":"ED365FE6-3ABF-4FC3-8E44-D9525A22DABD"},"features":["provisional_shots","shot_processing","profiles","power_status","shot_deleted","club"],"schema_version":2},"schema_version":2}
    ```
 3. Subscribe to the v2 shot characteristic. The latest v2 shot is replayed.
 4. Ask for state: `get_club`, `get_profiles` and, if wanted, `get_power_status`.
@@ -365,7 +365,8 @@ Notified on the v2 control characteristic. Each has `schema_version: 2` and a
 |---|---|---|
 | `club_changed` | `club` | Any club change (kiosk, phone, simulator) |
 | `profiles` | `profiles: [{id, name}]`, `active_profile_id` | After every profile request or mutation from any client, including rejected ones |
-| `session_cleared` | `profile_id` | After any client clears a profile's shots |
+| `session_cleared` | `profile_id` | After a profile's shots are cleared (kiosk or Wi-Fi) |
+| `shot_deleted` | `timestamp` (the shot's delete key) | After a shot is deleted (kiosk or Wi-Fi) |
 | `shot_processing` | `state`: `capturing`, `calculating` or `failed` | Rolling-buffer monitor progress; the next shot ends it |
 | `power_status` | the Socket.IO `power_status` payload: `available, provider, state, battery_percent, battery_voltage_v, external_power, updated_at, error` | Every 5 s with `--battery geekworm` |
 
@@ -373,6 +374,7 @@ Notified on the v2 control characteristic. Each has `schema_version: 2` and a
 {"club":"7-iron","schema_version":2,"type":"club_changed"}
 {"active_profile_id":"0f8e…","profiles":[{"id":"0f8e…","name":"Zoë ⛳"},{"id":"7c1d…","name":"Sam"}],"schema_version":2,"type":"profiles"}
 {"profile_id":"0f8e…","schema_version":2,"type":"session_cleared"}
+{"schema_version":2,"timestamp":"2026-09-25T14:03:07.412345","type":"shot_deleted"}
 {"schema_version":2,"state":"calculating","type":"shot_processing"}
 {"available":true,"battery_percent":76.5,"battery_voltage_v":3.98,"error":null,"external_power":false,"provider":"geekworm","schema_version":2,"state":"on_battery","type":"power_status","updated_at":"2026-09-25T14:03:05.000000+00:00"}
 ```
@@ -395,10 +397,13 @@ the kiosk and every other client see the same broadcasts.
 | `get_profiles` | `{}` | `{"status":"sent"}` | `profiles`: the roster arrives as the event, not in the result |
 | `set_active_profile` | `{"profile_id":…}` | `{"status":"applied","active_profile_id":…}`, or `ok:false` `Unknown profile` | `profiles` (also when rejected) |
 | `get_power_status` | `{}` | the `power_status` payload, or `ok:false` `Battery monitoring is not enabled` / `No battery reading yet` | |
-| `clear_session` | `{"profile_id":…}` (default: active profile) | `{"status":"cleared","profile_id":…}` | `session_cleared` |
-| `delete_shot` | `{"timestamp":"<shot timestamp>"}` | `{"status":"deleted","timestamp":…}`, or `ok:false` `Shot not found` | Socket.IO `session_state` |
 
-Adding, renaming and removing profiles stay on Socket.IO and the kiosk. An event
+Over BLE, v2 is read-and-select only (see [Security](#security-and-scope)).
+Adding, renaming and removing profiles, `clear_session` and `delete_shot` stay
+on Socket.IO and the kiosk; sent over BLE they fail with
+`Unsupported phone command: <type>` on either control characteristic. Phones
+still learn about those changes from the `profiles`, `session_cleared` and
+`shot_deleted` events. An event
 triggered by a command is normally notified before the command's response, but
 clients must accept either order. The Pi processes commands as they arrive and
 enforces no busy state or timeout of its own; clients own their timeouts.
@@ -413,7 +418,7 @@ stream; any other value returns `400`. A v2 stream opens with `: ping`, then
 the current state as `club_changed`, `profiles` and (with a battery monitor)
 `power_status`, then the latest v2 shot. Event names match the `type` of the
 payload: `shot`, `shot_processing`, `profiles`, `power_status`,
-`session_cleared` and `club_changed`. Commands stay on `/api/club`, the
+`session_cleared`, `shot_deleted` and `club_changed`. Commands stay on `/api/club`, the
 calibration route and Socket.IO.
 
 ```bash
@@ -450,11 +455,13 @@ Wi-Fi API as accessible to anything on the same network — the same assumption
 the browser UI already makes. Phone-assisted calibration can update and persist
 TI mount tilt, so use either transport only in a trusted environment.
 
-Schema v2 adds two destructive commands, `clear_session` and `delete_shot`,
-with the same exposure the browser UI's Socket.IO already has on the local
-network, but now also reachable by any nearby Bluetooth device. Authenticated
-pairing is still future work; until then enable `--ble` only where that is
-acceptable.
+BLE is unauthenticated: any nearby device can connect and write the control
+characteristics. Schema v2 therefore exposes only reading state and selecting
+(club, active profile) over Bluetooth, plus the calibration version one already
+had. Actions that delete data, clearing a session or deleting a shot, and
+profile add, rename and remove require Wi-Fi (the kiosk or Socket.IO), where
+they have the same exposure the browser UI already has. Revisit this only with
+authenticated pairing.
 
 ## Testing without hardware
 
