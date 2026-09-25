@@ -58,8 +58,7 @@ V2_FEATURES = (
     "shot_processing",
     "profiles",
     "power_status",
-    "session_clear",
-    "delete_shot",
+    "shot_deleted",
     "club",
 )
 
@@ -69,6 +68,7 @@ V2_EVENT_TYPES = (
     "profiles",
     "power_status",
     "session_cleared",
+    "shot_deleted",
     "club_changed",
 )
 
@@ -284,6 +284,13 @@ def build_control_response(
     else:
         response["error"] = error
     return response
+
+
+def build_shot_deleted_event(timestamp: str) -> dict:
+    """``shot_deleted``: the timestamp (the delete key) of a removed shot."""
+    if not isinstance(timestamp, str) or not timestamp:
+        raise ValueError("Deleted shot timestamp must be a non-empty string")
+    return build_event_v2("shot_deleted", {"timestamp": timestamp})
 
 
 def build_hello_result(client_schema_max) -> dict:

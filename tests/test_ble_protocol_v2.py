@@ -17,6 +17,7 @@ from openflight.ble.protocol import (
     build_hello_result,
     build_power_status_event,
     build_profiles_event,
+    build_shot_deleted_event,
     build_shot_event,
     build_shot_event_v2,
     encode_message_v2,
@@ -167,6 +168,24 @@ def test_v2_encoding_is_compact_sorted_utf8():
     assert "Zoë".encode() in payload
     decoded = json.loads(payload.decode("utf-8"))
     assert list(decoded) == sorted(decoded)
+
+
+def test_shot_deleted_event_carries_the_delete_key():
+    assert build_shot_deleted_event("2026-09-25T12:00:00.000001") == {
+        "schema_version": 2,
+        "type": "shot_deleted",
+        "timestamp": "2026-09-25T12:00:00.000001",
+    }
+    with pytest.raises(ValueError):
+        build_shot_deleted_event("")
+
+
+def test_hello_features_are_read_and_select_only():
+    features = build_hello_result(2)["features"]
+
+    assert "shot_deleted" in features
+    assert "delete_shot" not in features
+    assert "session_clear" not in features
 
 
 def test_v2_events_cannot_override_envelope_fields():

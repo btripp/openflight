@@ -38,6 +38,7 @@ from openflight.ble.protocol import (
     build_power_status_event,
     build_profiles_event,
     build_session_cleared_event,
+    build_shot_deleted_event,
     build_shot_event_v2,
     build_shot_processing_event,
     encode_club_event,
@@ -265,6 +266,13 @@ def build_goldens() -> dict[str, dict]:
             CONTROL_V2_CHARACTERISTIC_UUID,
             build_session_cleared_event(PROFILE_A),
             7,
+        ),
+        _v2(
+            "v2_event_shot_deleted",
+            "shot_deleted notify: a shot was deleted (over Wi-Fi/Socket.IO); key is its timestamp.",
+            CONTROL_V2_CHARACTERISTIC_UUID,
+            build_shot_deleted_event(shot_v2["timestamp"]),
+            9,
         ),
         _v2(
             "v2_event_club_changed",

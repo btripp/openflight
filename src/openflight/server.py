@@ -30,6 +30,7 @@ from .ble.protocol import (
     build_power_status_event,
     build_profiles_event,
     build_session_cleared_event,
+    build_shot_deleted_event,
     build_shot_processing_event,
 )
 from .clubs import ClubType
@@ -1173,8 +1174,12 @@ def dispatch_phone_control_command_v2(command_type, payload):
     """Route a schema v2 BLE phone command through the Socket.IO operations.
 
     Each command calls the same function its Socket.IO counterpart does, so the
-    kiosk and every other client see identical broadcasts. Profile add, rename
-    and remove deliberately stay on Socket.IO.
+    kiosk and every other client see identical broadcasts.
+
+    BLE has no authentication, so it is read-and-select only: profile add,
+    rename and remove, ``clear_session`` and ``delete_shot`` stay on
+    Socket.IO. Phones still hear about those changes through the
+    ``profiles``, ``session_cleared`` and ``shot_deleted`` events.
     """
     handlers = {
         "iwr6843_orientation_calibration": apply_iwr6843_orientation_calibration,
@@ -1183,8 +1188,6 @@ def dispatch_phone_control_command_v2(command_type, payload):
         "get_profiles": request_profiles,
         "set_active_profile": apply_active_profile,
         "get_power_status": current_power_status,
-        "clear_session": apply_clear_session,
-        "delete_shot": apply_delete_shot,
     }
     handler = handlers.get(command_type)
     if handler is None:
@@ -2303,6 +2306,7 @@ def apply_delete_shot(payload):
         return {"error": "Shot not found"}, 404
 
     socketio.emit("session_state", _session_state_payload())
+    _publish_phone_event(build_shot_deleted_event(timestamp))
     return {"status": "deleted", "timestamp": timestamp}, 200
 
 

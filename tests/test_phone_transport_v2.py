@@ -216,13 +216,12 @@ def test_v2_dispatch_uses_the_socketio_operations(phones):
     assert second.id in {item["id"] for item in stream.events[-1]["profiles"]}
 
 
-def test_v2_clear_session_broadcasts_like_socketio(phones):
+def test_socket_clear_session_also_notifies_v2_phones(phones):
     stream, ble, emitted = phones
     active = server_module.get_profile_store().get_active().id
 
-    response, status = server_module.dispatch_phone_control_command_v2("clear_session", {})
+    server_module.handle_clear_session({})
 
-    assert (status, response) == (200, {"status": "cleared", "profile_id": active})
     assert emitted == [("session_cleared", {"profile_id": active, "shots": []})]
     for transport in (stream, ble):
         assert transport.events == [
@@ -230,8 +229,8 @@ def test_v2_clear_session_broadcasts_like_socketio(phones):
         ]
 
 
-def test_v2_delete_shot_reports_missing_and_deleted_rows(phones, monkeypatch):
-    _stream, _ble, emitted = phones
+def test_socket_delete_shot_notifies_v2_phones_only_on_success(phones, monkeypatch):
+    stream, ble, emitted = phones
     shot = Shot(
         ball_speed_mph=150.0,
         timestamp=datetime(2026, 9, 25, 12, 0, 0, 1),
@@ -241,17 +240,35 @@ def test_v2_delete_shot_reports_missing_and_deleted_rows(phones, monkeypatch):
     monitor._shots.append(shot)
     monkeypatch.setattr(server_module, "monitor", monitor)
 
-    missing = server_module.dispatch_phone_control_command_v2(
-        "delete_shot", {"timestamp": "2026-01-01T00:00:00"}
-    )
-    deleted = server_module.dispatch_phone_control_command_v2(
-        "delete_shot", {"timestamp": shot.timestamp.isoformat()}
-    )
+    server_module.handle_delete_shot({"timestamp": "2026-01-01T00:00:00"})
+    for transport in (stream, ble):
+        assert transport.events == []
+    server_module.handle_delete_shot({"timestamp": shot.timestamp.isoformat()})
 
-    assert missing == ({"error": "Shot not found"}, 404)
-    assert deleted == ({"status": "deleted", "timestamp": shot.timestamp.isoformat()}, 200)
     assert [event for event, _ in emitted] == ["delete_shot_error", "session_state"]
     assert monitor.get_shots() == []
+    for transport in (stream, ble):
+        assert transport.events == [
+            {
+                "schema_version": 2,
+                "type": "shot_deleted",
+                "timestamp": shot.timestamp.isoformat(),
+            }
+        ]
+
+
+@pytest.mark.parametrize("command", ["clear_session", "delete_shot"])
+def test_destructive_commands_are_not_routed_over_ble(phones, command):
+    _stream, _ble, emitted = phones
+
+    for dispatch in (
+        server_module.dispatch_phone_control_command,
+        server_module.dispatch_phone_control_command_v2,
+    ):
+        response, status = dispatch(command, {"timestamp": "2026-09-25T12:00:00"})
+        assert status == 400
+        assert response["error"] == f"Unsupported phone command: {command}"
+    assert emitted == []
 
 
 def test_v2_power_status_command_returns_the_socketio_payload(phones, monkeypatch):
@@ -279,7 +296,7 @@ def test_v2_power_status_command_returns_the_socketio_payload(phones, monkeypatc
 
 
 def test_v1_dispatch_does_not_grow_v2_commands(phones):
-    for command in ("get_profiles", "set_active_profile", "clear_session", "delete_shot"):
+    for command in ("get_profiles", "set_active_profile", "get_power_status"):
         response, status = server_module.dispatch_phone_control_command(command, {})
         assert status == 400
         assert response["error"] == f"Unsupported phone command: {command}"

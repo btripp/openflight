@@ -277,26 +277,55 @@ def test_v2_session_and_power_commands(pi, monkeypatch):
     )
     assert waiting["error"] == "No battery reading yet"
 
-    active_id = server_module.get_profile_store().get_active().id
-    cleared = phone.request(
-        "clear_session", {}, control=CONTROL_V2_CHARACTERISTIC_UUID, schema_version=2
+
+def test_destructive_commands_are_not_available_over_ble(pi):
+    """BLE is unauthenticated, so it is read-and-select only."""
+    phone = pi.central("v2-app")
+    phone.subscribe(*V1_UUIDS, *V2_UUIDS)
+
+    for command, payload in (
+        ("clear_session", {}),
+        ("delete_shot", {"timestamp": "2026-09-25T12:00:00"}),
+    ):
+        for control, schema in (
+            (CONTROL_CHARACTERISTIC_UUID, 1),
+            (CONTROL_V2_CHARACTERISTIC_UUID, 2),
+        ):
+            answer = phone.request(command, payload, control=control, schema_version=schema)
+            assert answer["ok"] is False
+            assert answer["error"] == f"Unsupported phone command: {command}"
+    assert pi.emitted == []
+
+
+def test_wifi_clear_and_delete_reach_ble_phones_as_events(pi, monkeypatch):
+    shot = Shot(
+        ball_speed_mph=150.0,
+        timestamp=datetime(2026, 9, 25, 12, 0, 0, 5),
+        club=ClubType.DRIVER,
     )
-    assert cleared["result"] == {"status": "cleared", "profile_id": active_id}
-    event = phone.wait_for(
+    monitor = server_module.MockLaunchMonitor()
+    monitor._shots.append(shot)
+    monkeypatch.setattr(server_module, "monitor", monitor)
+    phone = pi.central("v2-app")
+    phone.subscribe(*V2_UUIDS)
+    active_id = server_module.get_profile_store().get_active().id
+
+    server_module.handle_delete_shot({"timestamp": shot.timestamp.isoformat()})
+    server_module.handle_clear_session({})
+
+    deleted = phone.wait_for(
+        CONTROL_V2_CHARACTERISTIC_UUID, lambda message: message.get("type") == "shot_deleted"
+    )
+    cleared = phone.wait_for(
         CONTROL_V2_CHARACTERISTIC_UUID,
         lambda message: message.get("type") == "session_cleared",
     )
-    assert event == {"schema_version": 2, "type": "session_cleared", "profile_id": active_id}
-
-    missing = phone.request(
-        "delete_shot",
-        {"timestamp": "2026-09-25T12:00:00"},
-        control=CONTROL_V2_CHARACTERISTIC_UUID,
-        schema_version=2,
-    )
-    assert missing["ok"] is False
-    assert missing["error"] == "Shot not found"
-    assert ("delete_shot_error", {"error": "Shot not found"}) in pi.emitted
+    assert deleted == {
+        "schema_version": 2,
+        "type": "shot_deleted",
+        "timestamp": shot.timestamp.isoformat(),
+    }
+    assert cleared == {"schema_version": 2, "type": "session_cleared", "profile_id": active_id}
 
 
 def test_unsubscribing_one_pair_keeps_the_other_flowing(pi):
