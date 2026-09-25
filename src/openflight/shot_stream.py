@@ -1,7 +1,9 @@
 """Fan out completed shots to HTTP clients as Server-Sent Events.
 
-This is the Wi-Fi sibling of the BLE publisher: same versioned payload, same
-bounded-queue delivery policy, same isolation from shot recording. It exists so
+This is the Wi-Fi sibling of the BLE publisher: same versioned payloads, same
+bounded-queue delivery policy, same isolation from shot recording. Clients get
+version one by default and schema v2 (provisional and final shots plus
+profile, power, processing and club events) with ``?schema=2``. It exists so
 a phone can receive shots over the network on hardware where BLE advertising is
 unavailable, and so the payload contract can be exercised with nothing but
 ``curl``.
@@ -12,11 +14,19 @@ from __future__ import annotations
 import logging
 import queue
 import threading
-from typing import Iterator, Mapping
+from typing import Iterable, Iterator, Mapping
 
 # The wire payload is the same versioned V1 shot event the BLE transport sends,
 # so both transports are validated against one contract and one test fixture.
-from .ble.protocol import encode_club_event, encode_shot_event
+from .ble.protocol import (
+    SCHEMA_VERSION,
+    SCHEMA_VERSION_V2,
+    build_club_event_v2,
+    encode_club_event,
+    encode_message_v2,
+    encode_shot_event,
+    encode_shot_event_v2,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -77,7 +87,11 @@ class ShotStreamBroker:
 
         self._lock = threading.Lock()
         self._subscribers: list[queue.Queue[StreamEvent]] = []
+        # Subscribers that opted into schema v2 with ``?schema=2``. Everyone
+        # else keeps receiving the unchanged version-one stream.
+        self._v2_subscribers: set[int] = set()
         self._latest_payload: bytes | None = None
+        self._latest_v2_payload: bytes | None = None
 
     @property
     def subscriber_count(self) -> int:
@@ -95,38 +109,110 @@ class ShotStreamBroker:
 
         with self._lock:
             self._latest_payload = payload
-            subscribers = list(self._subscribers)
+            subscribers = self._subscribers_for(SCHEMA_VERSION)
         event = StreamEvent("shot", payload)
         for subscriber in subscribers:
             self._offer(subscriber, event)
+        return True
+
+    def publish_v2_shot(
+        self,
+        shot_data: Mapping,
+        *,
+        final: bool,
+        enrichment: Mapping | None = None,
+    ) -> bool:
+        """Send a provisional or final v2 shot to schema v2 subscribers."""
+        try:
+            payload = encode_shot_event_v2(shot_data, final=final, enrichment=enrichment)
+        except (KeyError, TypeError, ValueError):
+            logger.warning("[STREAM] Failed to encode v2 shot payload", exc_info=True)
+            return False
+
+        with self._lock:
+            self._latest_v2_payload = payload
+            subscribers = self._subscribers_for(SCHEMA_VERSION_V2)
+        event = StreamEvent("shot", payload)
+        for subscriber in subscribers:
+            self._offer(subscriber, event)
+        return True
+
+    def publish_event_v2(self, event: Mapping) -> bool:
+        """Send one schema v2 event, named by its ``type``, to v2 subscribers."""
+        try:
+            stream_event = StreamEvent(str(event["type"]), encode_message_v2(event))
+        except (KeyError, TypeError, ValueError):
+            logger.warning("[STREAM] Failed to encode v2 event", exc_info=True)
+            return False
+
+        with self._lock:
+            subscribers = self._subscribers_for(SCHEMA_VERSION_V2)
+        for subscriber in subscribers:
+            self._offer(subscriber, stream_event)
         return True
 
     def publish_club(self, club: str) -> bool:
         """Broadcast an authoritative club change to every Wi-Fi subscriber."""
         try:
             event = StreamEvent("club_changed", encode_club_event(club))
+            v2_event = StreamEvent("club_changed", encode_message_v2(build_club_event_v2(club)))
         except (TypeError, ValueError):
             logger.warning("[STREAM] Failed to encode club payload", exc_info=True)
             return False
 
         with self._lock:
-            subscribers = list(self._subscribers)
+            subscribers = self._subscribers_for(SCHEMA_VERSION)
+            v2_subscribers = self._subscribers_for(SCHEMA_VERSION_V2)
         for subscriber in subscribers:
             self._offer(subscriber, event)
+        for subscriber in v2_subscribers:
+            self._offer(subscriber, v2_event)
         return True
 
-    def subscribe(self) -> queue.Queue[StreamEvent]:
-        """Register a subscriber, seeded with the latest shot for replay."""
+    def subscribe(
+        self,
+        *,
+        schema: int = SCHEMA_VERSION,
+        initial_events: Iterable[Mapping] = (),
+    ) -> queue.Queue[StreamEvent]:
+        """Register a subscriber, seeded with the latest shot for replay.
+
+        A schema v2 subscriber is first seeded with ``initial_events`` (current
+        state such as club and profiles), then the latest v2 shot.
+        """
+        if schema not in (SCHEMA_VERSION, SCHEMA_VERSION_V2):
+            raise ValueError(f"Unsupported shot stream schema: {schema}")
+        seed = []
+        if schema == SCHEMA_VERSION_V2:
+            for event in initial_events:
+                try:
+                    seed.append(StreamEvent(str(event["type"]), encode_message_v2(event)))
+                except (KeyError, TypeError, ValueError):
+                    logger.warning("[STREAM] Failed to encode initial v2 event", exc_info=True)
         with self._lock:
             if len(self._subscribers) >= self.max_subscribers:
                 raise ShotStreamFull(f"Shot stream already has {self.max_subscribers} clients")
-            subscriber: queue.Queue[StreamEvent] = queue.Queue(maxsize=self.queue_size)
-            if self._latest_payload is not None:
-                subscriber.put_nowait(StreamEvent("shot", self._latest_payload))
+            latest = (
+                self._latest_v2_payload if schema == SCHEMA_VERSION_V2 else self._latest_payload
+            )
+            if latest is not None:
+                seed.append(StreamEvent("shot", latest))
+            subscriber: queue.Queue[StreamEvent] = queue.Queue(
+                maxsize=max(self.queue_size, len(seed))
+            )
+            for event in seed:
+                subscriber.put_nowait(event)
             self._subscribers.append(subscriber)
+            if schema == SCHEMA_VERSION_V2:
+                self._v2_subscribers.add(id(subscriber))
             count = len(self._subscribers)
-        logger.info("[STREAM] Client subscribed (%d streaming)", count)
+        logger.info("[STREAM] Client subscribed (%d streaming, schema %d)", count, schema)
         return subscriber
+
+    def _subscribers_for(self, schema: int) -> list[queue.Queue[StreamEvent]]:
+        """Subscribers of one schema; the caller holds ``_lock``."""
+        v2 = schema == SCHEMA_VERSION_V2
+        return [item for item in self._subscribers if (id(item) in self._v2_subscribers) == v2]
 
     def unsubscribe(self, subscriber: queue.Queue[StreamEvent]) -> None:
         """Drop a subscriber. Unsubscribing twice is not an error."""
@@ -134,6 +220,7 @@ class ShotStreamBroker:
             if subscriber not in self._subscribers:
                 return
             self._subscribers.remove(subscriber)
+            self._v2_subscribers.discard(id(subscriber))
             count = len(self._subscribers)
         logger.info("[STREAM] Client unsubscribed (%d streaming)", count)
 

@@ -25,6 +25,13 @@ from flask_cors import CORS
 from flask_socketio import SocketIO
 
 from .ballistics import resolve_launch, simulate
+from .ble.protocol import (
+    build_club_event_v2,
+    build_power_status_event,
+    build_profiles_event,
+    build_session_cleared_event,
+    build_shot_processing_event,
+)
 from .clubs import ClubType
 from .clubs.physics import (
     SHOT_SIMULATION_DEFAULTS,
@@ -216,6 +223,9 @@ class _ShotEnrichmentResult:
     iwr6843_ms: float | None = None
     kld7_ms: float | None = None
     camera_capture_ms: float | None = None
+    # Why optional hardware was skipped for this shot (``deadline``,
+    # ``capacity``, ``queue_full``, ``worker_unavailable``); None when it ran.
+    skipped_reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -358,7 +368,9 @@ def _shot_finalization_worker_loop() -> None:
                     shot=registered.shot,
                     emit_event=registered.emit_event,
                     initial_ui_ms=registered.initial_ui_ms,
-                    enrichment=_ShotEnrichmentResult(),
+                    enrichment=_ShotEnrichmentResult(
+                        skipped_reason="deadline" if deadline_expired else "capacity"
+                    ),
                 )
             elif pending.shot is not registered.shot:
                 for shot_field in fields(Shot):
@@ -1145,7 +1157,7 @@ def _broadcast_club_selection(club: ClubType) -> None:
 
 
 def dispatch_phone_control_command(command_type, payload):
-    """Route a versioned BLE phone command to the shared server operation."""
+    """Route a version-one BLE phone command to the shared server operation."""
     handlers = {
         "iwr6843_orientation_calibration": apply_iwr6843_orientation_calibration,
         "set_club": apply_club_selection,
@@ -1155,6 +1167,43 @@ def dispatch_phone_control_command(command_type, payload):
     if handler is None:
         return {"error": f"Unsupported phone command: {command_type}"}, 400
     return handler(payload)
+
+
+def dispatch_phone_control_command_v2(command_type, payload):
+    """Route a schema v2 BLE phone command through the Socket.IO operations.
+
+    Each command calls the same function its Socket.IO counterpart does, so the
+    kiosk and every other client see identical broadcasts. Profile add, rename
+    and remove deliberately stay on Socket.IO.
+    """
+    handlers = {
+        "iwr6843_orientation_calibration": apply_iwr6843_orientation_calibration,
+        "set_club": apply_club_selection,
+        "get_club": current_club_selection,
+        "get_profiles": request_profiles,
+        "set_active_profile": apply_active_profile,
+        "get_power_status": current_power_status,
+        "clear_session": apply_clear_session,
+        "delete_shot": apply_delete_shot,
+    }
+    handler = handlers.get(command_type)
+    if handler is None:
+        return {"error": f"Unsupported phone command: {command_type}"}, 400
+    return handler(payload)
+
+
+def _phone_state_events_v2() -> list[dict]:
+    """Current club, profiles and power, as seeded to a new schema v2 SSE client."""
+    with club_selection_lock:
+        club_value = active_club.value
+    events = [build_club_event_v2(club_value)]
+    try:
+        events.append(build_profiles_event(get_profile_store().snapshot()))
+    except Exception:  # pylint: disable=broad-exception-caught
+        logger.warning("[SERVER] Could not read profiles for the shot stream", exc_info=True)
+    if power_monitor is not None and power_monitor.status is not None:
+        events.append(build_power_status_event(power_monitor.status.to_dict()))
+    return events
 
 
 @app.route("/api/club", methods=["GET", "POST"])
@@ -1703,9 +1752,18 @@ def handle_get_camera_capture_settings():
 
 @app.route("/api/shots/stream")
 def shots_stream():
-    """Stream completed shots to the iOS app as Server-Sent Events."""
+    """Stream completed shots to phones as Server-Sent Events.
+
+    ``?schema=2`` opts into schema v2 events; the default stays version one.
+    """
+    schema_arg = request.args.get("schema", "1")
+    if schema_arg not in ("1", "2"):
+        return {"error": "Unsupported schema; use 1 or 2"}, 400
     try:
-        subscriber = shot_stream.subscribe()
+        if schema_arg == "2":
+            subscriber = shot_stream.subscribe(schema=2, initial_events=_phone_state_events_v2())
+        else:
+            subscriber = shot_stream.subscribe()
     except ShotStreamFull as exc:
         logger.warning("[SERVER] Refused shot stream client: %s", exc)
         return str(exc), 503
@@ -1999,8 +2057,20 @@ def _emit_sim_snapshot() -> None:
 
 
 def _on_power_status(status: PowerStatus) -> None:
-    """Publish one battery reading to connected UI clients."""
-    socketio.emit("power_status", status.to_dict())
+    """Publish one battery reading to connected UI clients and v2 phones."""
+    payload = status.to_dict()
+    socketio.emit("power_status", payload)
+    _publish_phone_event(build_power_status_event(payload))
+
+
+def current_power_status(_payload=None):
+    """Return the latest battery reading, as ``power_status`` carries it."""
+    if power_monitor is None:
+        return {"error": "Battery monitoring is not enabled"}, 409
+    status = power_monitor.status
+    if status is None:
+        return {"error": "No battery reading yet"}, 409
+    return status.to_dict(), 200
 
 
 def _log_power_status(status: PowerStatus) -> None:
@@ -2065,20 +2135,41 @@ def _emit_profiles() -> None:
     Sent after every mutation, including rejected ones, so a stale client
     self-heals on the next round trip instead of needing an error event.
     """
-    socketio.emit("profiles", get_profile_store().snapshot())
+    snapshot = get_profile_store().snapshot()
+    socketio.emit("profiles", snapshot)
+    _publish_phone_event(build_profiles_event(snapshot))
+
+
+def request_profiles(_payload=None):
+    """Broadcast the roster, as Socket.IO ``get_profiles`` does."""
+    _emit_profiles()
+    return {"status": "sent"}, 200
+
+
+def apply_active_profile(payload=None):
+    """Change which profile shots are attributed to, then broadcast the roster.
+
+    The roster goes out even when the id is unknown, so every client converges
+    on the unchanged selection.
+    """
+    store = get_profile_store()
+    applied = store.set_active(_payload_dict(payload).get("profile_id"))
+    _emit_profiles()
+    if not applied:
+        return {"error": "Unknown profile"}, 404
+    return {"status": "applied", "active_profile_id": store.get_active().id}, 200
 
 
 @socketio.on("get_profiles")
 def handle_get_profiles():
     """Send the roster to a client that asked for it."""
-    _emit_profiles()
+    request_profiles()
 
 
 @socketio.on("set_active_profile")
 def handle_set_active_profile(data=None):
     """Change which profile shots are attributed to."""
-    get_profile_store().set_active(_payload_dict(data).get("profile_id"))
-    _emit_profiles()
+    apply_active_profile(data)
 
 
 @socketio.on("add_profile")
@@ -2170,16 +2261,23 @@ def _clear_profile_rows(profile_id: str) -> None:
         monitor.clear_session()
 
 
-@socketio.on("clear_session")
-def handle_clear_session(data=None):
-    """Clear recorded rows for one profile only."""
-    raw_id = _payload_dict(data).get("profile_id")
+def apply_clear_session(payload=None):
+    """Clear recorded rows for one profile (default: the active one)."""
+    raw_id = _payload_dict(payload).get("profile_id")
     profile_id = str(raw_id).strip() if raw_id else get_profile_store().get_active().id
     _clear_profile_rows(profile_id)
     socketio.emit(
         "session_cleared",
         {"profile_id": profile_id, "shots": _session_shots()},
     )
+    _publish_phone_event(build_session_cleared_event(profile_id))
+    return {"status": "cleared", "profile_id": profile_id}, 200
+
+
+@socketio.on("clear_session")
+def handle_clear_session(data=None):
+    """Clear recorded rows for one profile only."""
+    apply_clear_session(data)
 
 
 @socketio.on("upload_cloud")
@@ -2195,17 +2293,23 @@ def handle_get_session():
         socketio.emit("session_state", _session_state_payload())
 
 
-@socketio.on("delete_shot")
-def handle_delete_shot(data):
-    """Delete one recorded shot or swing-speed rep from the current session."""
-    timestamp = data.get("timestamp") if isinstance(data, dict) else None
+def apply_delete_shot(payload):
+    """Delete one recorded shot or swing-speed rep, keyed by its timestamp."""
+    timestamp = payload.get("timestamp") if isinstance(payload, dict) else None
     deleted = _delete_session_row(timestamp)
 
     if not deleted:
         socketio.emit("delete_shot_error", {"error": "Shot not found"})
-        return
+        return {"error": "Shot not found"}, 404
 
     socketio.emit("session_state", _session_state_payload())
+    return {"status": "deleted", "timestamp": timestamp}, 200
+
+
+@socketio.on("delete_shot")
+def handle_delete_shot(data):
+    """Delete one recorded shot or swing-speed rep from the current session."""
+    apply_delete_shot(data)
 
 
 @socketio.on("simulate_shot")
@@ -2353,6 +2457,10 @@ def handle_shutdown():
 def on_shot_processing(state: str) -> None:
     """Forward the rolling-buffer processing lifecycle to the UI."""
     socketio.emit("shot_processing", {"state": state})
+    try:
+        _publish_phone_event(build_shot_processing_event(state))
+    except ValueError:
+        logger.warning("[SERVER] Ignoring invalid shot processing state %r", state)
 
 
 def _forward_shot_to_simulators(shot: Shot) -> None:
@@ -3542,6 +3650,15 @@ def _finalize_shot_detected(
         except Exception as e:  # pylint: disable=broad-exception-caught
             logger.warning("[SERVER] Failed to queue streamed shot: %s", e, exc_info=True)
 
+    # Schema v2 phones get the final shot too, marked final and carrying the
+    # event_id of any provisional shot published for it.
+    if shot_data is not None:
+        _publish_phone_shot_v2(
+            shot_data,
+            final=True,
+            enrichment=_final_phone_enrichment(emit_event, enrichment),
+        )
+
     # Forward to simulator connectors (optional)
     _forward_shot_to_simulators(shot)
 
@@ -3648,6 +3765,51 @@ def _queue_ordered_shot_finalization(
         _shot_finalization_condition.notify_all()
 
 
+def _final_phone_enrichment(
+    emit_event: str,
+    enrichment: _ShotEnrichmentResult,
+) -> dict | None:
+    """Describe optional-hardware progress on a final v2 shot.
+
+    Only shots that were published provisionally (``emit_event`` is
+    ``shot_update``) carry an ``enrichment`` object; the rest never waited.
+    """
+    if emit_event != "shot_update":
+        return None
+    if enrichment.skipped_reason:
+        return {"status": "skipped", "reason": enrichment.skipped_reason}
+    return {"status": "complete"}
+
+
+def _publish_phone_shot_v2(
+    shot_data: dict,
+    *,
+    final: bool,
+    enrichment: dict | None,
+) -> None:
+    """Hand one v2 shot to the BLE and SSE phone transports; never raises."""
+    transports = [("Wi-Fi stream", shot_stream)]
+    if ble_publisher is not None:
+        transports.append(("BLE", ble_publisher))
+    for name, transport in transports:
+        try:
+            transport.publish_v2_shot(shot_data, final=final, enrichment=enrichment)
+        except Exception:  # pylint: disable=broad-exception-caught
+            logger.warning("[SERVER] Failed to queue v2 shot over %s", name, exc_info=True)
+
+
+def _publish_phone_event(event: dict) -> None:
+    """Hand one schema v2 event to the BLE and SSE phone transports; never raises."""
+    transports = [("Wi-Fi stream", shot_stream)]
+    if ble_publisher is not None:
+        transports.append(("BLE", ble_publisher))
+    for name, transport in transports:
+        try:
+            transport.publish_event_v2(event)
+        except Exception:  # pylint: disable=broad-exception-caught
+            logger.warning("[SERVER] Failed to queue v2 event over %s", name, exc_info=True)
+
+
 def _emit_initial_ops_shot(shot: Shot) -> bool:
     """Publish immediately available OPS metrics before slow enrichments."""
     try:
@@ -3666,6 +3828,9 @@ def _emit_initial_ops_shot(shot: Shot) -> bool:
                 "pending": pending,
             },
         )
+        # Schema v2 phones get the same provisional shot. The final one follows
+        # from _finalize_shot_detected with the same event_id.
+        _publish_phone_shot_v2(shot_data, final=False, enrichment={"status": "pending"})
         return True
     except Exception as error:  # pylint: disable=broad-exception-caught
         logger.error("[SERVER] Failed to emit initial OPS shot: %s", error, exc_info=True)
@@ -3832,6 +3997,7 @@ def _handle_shot_detected(shot: Shot) -> None:
             shot,
             emit_event=final_event,
             initial_ui_ms=initial_ui_ms,
+            enrichment=_ShotEnrichmentResult(skipped_reason="queue_full"),
         )
     except Exception as error:  # pylint: disable=broad-exception-caught
         logger.warning(
@@ -3845,6 +4011,7 @@ def _handle_shot_detected(shot: Shot) -> None:
             shot,
             emit_event=final_event,
             initial_ui_ms=initial_ui_ms,
+            enrichment=_ShotEnrichmentResult(skipped_reason="worker_unavailable"),
         )
 
 
@@ -5248,7 +5415,10 @@ def main():
     if args.ble:
         from .ble import BleShotPublisher  # pylint: disable=import-outside-toplevel
 
-        ble_publisher = BleShotPublisher(command_handler=dispatch_phone_control_command)
+        ble_publisher = BleShotPublisher(
+            command_handler=dispatch_phone_control_command,
+            command_handler_v2=dispatch_phone_control_command_v2,
+        )
         ble_publisher.start()
         print("Bluetooth LE enabled (advertising as OpenFlight)")
 
