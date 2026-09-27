@@ -1,6 +1,6 @@
 """Fan out completed shots to HTTP clients as Server-Sent Events.
 
-This is the Wi-Fi sibling of the BLE publisher: same versioned payloads, same
+This is the network sibling of the BLE publisher: same versioned payloads, same
 bounded-queue delivery policy, same isolation from shot recording. Clients get
 version one by default and schema v2 (provisional and final shots plus
 profile, power, processing and club events) with ``?schema=2``. It exists so
@@ -152,7 +152,7 @@ class ShotStreamBroker:
         return True
 
     def publish_club(self, club: str) -> bool:
-        """Broadcast an authoritative club change to every Wi-Fi subscriber."""
+        """Broadcast an authoritative club change to every network subscriber."""
         try:
             event = StreamEvent("club_changed", encode_club_event(club))
             v2_event = StreamEvent("club_changed", encode_message_v2(build_club_event_v2(club)))

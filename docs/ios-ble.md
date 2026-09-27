@@ -1,9 +1,9 @@
-# Phone app connection (Bluetooth LE and Wi-Fi)
+# Phone app connection (Bluetooth LE and network)
 
 > **BLE blocker — check the Raspberry Pi kernel first:** Raspberry Pi kernel
 > `6.18.34+rpt-rpi-2712` has a confirmed regression that rejects every BLE
 > advertisement. Run `uname -r` on the Pi. If it reports that version, use the
-> Wi-Fi transport or boot a working kernel such as 6.12.x; there is no userspace
+> network transport or boot a working kernel such as 6.12.x; there is no userspace
 > workaround. See the [full diagnosis](#known-bad-raspberry-pi-kernel-61834rpt-rpi-2712).
 
 OpenFlight sends each completed shot from a Raspberry Pi to a phone app over one
@@ -19,10 +19,10 @@ below, so an app behaves the same either way. Two apps speak this protocol:
 
 | Transport | Pi setup | Use it when |
 |---|---|---|
-| **Bluetooth** | start with `--ble` | No Wi-Fi at all, or the phone is not on the Pi's network |
-| **Wi-Fi** | always on | The phone and Pi share a network, or Bluetooth advertising is unavailable |
+| **Bluetooth** | start with `--ble` | The phone cannot reach the Pi over a network |
+| **Network** | always on | The phone can reach the Pi over IP (Wi-Fi, Ethernet or any other link), or Bluetooth advertising is unavailable |
 
-Wi-Fi needs no flag: it streams from the same HTTP server that serves the
+The network transport needs no flag: it streams from the same HTTP server that serves the
 browser UI, and exposes nothing the browser UI does not already broadcast.
 
 ## Requirements
@@ -54,7 +54,7 @@ scripts/start-kiosk.sh --ble
 BLE startup and delivery errors are isolated from shot recording. If Bluetooth
 is unavailable, the browser UI and session logger continue to work.
 
-## Wi-Fi transport
+## Network transport
 
 The server streams shots as [Server-Sent Events](https://developer.mozilla.org/docs/Web/API/Server-sent_events)
 at `/api/shots/stream`. Check it from any machine on the network before
@@ -75,7 +75,8 @@ event: shot
 data: {"ball_speed_mph":151.4,"club":"driver",...,"schema_version":1}
 ```
 
-In the app, pick **Wi-Fi** and enter the Pi's address. `raspberrypi.local:8080`
+In the app, pick **Wi-Fi** (the app's label; it works over any IP network, so
+the Pi can be on Ethernet) and enter the Pi's address. `raspberrypi.local:8080`
 is the default and works on a stock Raspberry Pi OS install, which publishes its
 hostname over mDNS; if you renamed the Pi, use `<hostname>.local:8080` or its IP.
 The port defaults to 8080 when you leave it off. The app reconnects on its own
@@ -100,7 +101,7 @@ physical-device, simulator, testing, and troubleshooting instructions, see
    transport.
 
 Over Bluetooth the app scans only for the OpenFlight service, connects
-automatically, and subscribes to shot and control notifications. Over Wi-Fi it
+automatically, and subscribes to shot and control notifications. Over the network it
 opens the shot stream and keeps it open. Either way, hit a shot and its metrics
 should replace the empty dashboard. The most recent shot is replayed when a
 phone connects, so a newly connected phone does not have to wait for another
@@ -114,7 +115,7 @@ confirms the change before the app updates its saved selection. The app sends
 the change over the currently selected transport:
 
 - Bluetooth uses the framed control characteristic described below.
-- Wi-Fi sends `POST /api/club` with `{"club":"7-iron"}`.
+- The network transport sends `POST /api/club` with `{"club":"7-iron"}`.
 
 The browser UI and simulator integrations use the same server operation, so a
 phone club change affects the same launch, spin, and carry processing state.
@@ -129,7 +130,7 @@ The dashboard's **Calibrate TI Radar** button opens a guided mount-angle tool.
 It sends the measurement over whichever transport is selected on the dashboard.
 
 1. Start OpenFlight with the IWR6843 enabled. Add `--ble` for Bluetooth, or
-   connect the phone to the Pi's network for Wi-Fi.
+   make sure the phone can reach the Pi over the network.
 2. Remove the phone case. Hold the phone upright in portrait with its back flat
    against a straight reference surface parallel to the TI antenna face. Keep
    the screen facing the target and avoid resting on the camera bump.
@@ -164,7 +165,7 @@ precision substitute for target-line alignment.
 
 ## Wire protocol
 
-Both transports carry the same JSON event. Only the framing differs: Wi-Fi sends
+Both transports carry the same JSON event. Only the framing differs: the network transport sends
 it whole in one SSE `data:` line, while BLE splits it across notifications.
 
 Over BLE, OpenFlight advertises one service with a shot notification and a
@@ -365,8 +366,8 @@ Notified on the v2 control characteristic. Each has `schema_version: 2` and a
 |---|---|---|
 | `club_changed` | `club` | Any club change (kiosk, phone, simulator) |
 | `profiles` | `profiles: [{id, name}]`, `active_profile_id` | After every profile request or mutation from any client, including rejected ones |
-| `session_cleared` | `profile_id` | After a profile's shots are cleared (kiosk or Wi-Fi) |
-| `shot_deleted` | `timestamp` (the shot's delete key) | After a shot is deleted (kiosk or Wi-Fi) |
+| `session_cleared` | `profile_id` | After a profile's shots are cleared (kiosk or network clients) |
+| `shot_deleted` | `timestamp` (the shot's delete key) | After a shot is deleted (kiosk or network clients) |
 | `shot_processing` | `state`: `capturing`, `calculating` or `failed` | Rolling-buffer monitor progress; the next shot ends it |
 | `power_status` | the Socket.IO `power_status` payload: `available, provider, state, battery_percent, battery_voltage_v, external_power, updated_at, error` | Every 5 s with `--battery geekworm` |
 
@@ -410,7 +411,7 @@ enforces no busy state or timeout of its own; clients own their timeouts.
 Version-one commands keep working on the v1 control characteristic, and v2-only
 commands sent there fail with `Unsupported phone command`.
 
-### Wi-Fi: `?schema=2`
+### Network: `?schema=2`
 
 `GET /api/shots/stream?schema=2` opts a Server-Sent Events client into schema
 v2. The default (no parameter, or `schema=1`) is the unchanged version-one
@@ -451,7 +452,7 @@ message that would not fit instead of sending a truncated one.
 Version one intentionally has no application authentication or encryption layer
 on either transport. Enable BLE only where nearby Bluetooth devices receiving
 shots and issuing club or calibration commands is acceptable, and treat the
-Wi-Fi API as accessible to anything on the same network — the same assumption
+network API as accessible to anything on the same network — the same assumption
 the browser UI already makes. Phone-assisted calibration can update and persist
 TI mount tilt, so use either transport only in a trusted environment.
 
@@ -459,7 +460,7 @@ BLE is unauthenticated: any nearby device can connect and write the control
 characteristics. Schema v2 therefore exposes only reading state and selecting
 (club, active profile) over Bluetooth, plus the calibration version one already
 had. Actions that delete data, clearing a session or deleting a shot, and
-profile add, rename and remove require Wi-Fi (the kiosk or Socket.IO), where
+profile add, rename and remove require the network (the kiosk or Socket.IO), where
 they have the same exposure the browser UI already has. Revisit this only with
 authenticated pairing.
 
@@ -502,11 +503,11 @@ uv run python scripts/ble/generate_goldens.py --check
 What still needs a Pi and phones: BlueZ advertising, discovery and
 connection from iOS and Android, pairing and permission prompts, fragment
 pacing over a real link, reconnects after a Pi restart, background behaviour,
-and coexistence with Wi-Fi and Socket.IO clients.
+and coexistence with SSE and Socket.IO clients.
 
 ## Troubleshooting
 
-**The Wi-Fi transport will not connect.**
+**The network transport will not connect.**
 
 - Confirm the address with `curl -N http://<host>:8080/api/shots/stream` from a
   computer on the same network. If curl works and the app does not, the problem
@@ -572,7 +573,7 @@ a zero-byte payload:
 
 Nothing in userspace can shrink a zero-byte payload, so no OpenFlight or Bless
 setting works around this. Boot a kernel without the regression (6.12.x is
-reported to work) and rerun the probe. Until then, use the Wi-Fi transport
+reported to work) and rerun the probe. Until then, use the network transport
 above: it needs no Bluetooth and delivers the identical payload.
 
 **The Pi logs that Bluetooth is unavailable.**

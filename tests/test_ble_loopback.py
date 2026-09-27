@@ -297,7 +297,7 @@ def test_destructive_commands_are_not_available_over_ble(pi):
     assert pi.emitted == []
 
 
-def test_wifi_clear_and_delete_reach_ble_phones_as_events(pi, monkeypatch):
+def test_network_clear_and_delete_reach_ble_phones_as_events(pi, monkeypatch):
     shot = Shot(
         ball_speed_mph=150.0,
         timestamp=datetime(2026, 9, 25, 12, 0, 0, 5),

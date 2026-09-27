@@ -185,7 +185,7 @@ ble_publisher = None
 active_club = ClubType.DRIVER
 club_selection_lock = threading.Lock()
 
-# Wi-Fi shot delivery for the iOS app. Always available: it exposes the same
+# Network shot delivery for phone apps. Always available: it exposes the same
 # shots the browser UI already broadcasts over WebSocket, so it adds no reach
 # beyond the existing HTTP server.
 shot_stream = ShotStreamBroker()
@@ -1149,7 +1149,7 @@ def _broadcast_club_selection(club: ClubType) -> None:
     try:
         shot_stream.publish_club(club.value)
     except Exception:  # pylint: disable=broad-exception-caught
-        logger.warning("[SERVER] Failed to broadcast club over Wi-Fi stream", exc_info=True)
+        logger.warning("[SERVER] Failed to broadcast club over network stream", exc_info=True)
     if ble_publisher is not None:
         try:
             ble_publisher.publish_club(club.value)
@@ -1211,7 +1211,7 @@ def _phone_state_events_v2() -> list[dict]:
 
 @app.route("/api/club", methods=["GET", "POST"])
 def api_club_selection():
-    """Read or set the active club over Wi-Fi."""
+    """Read or set the active club over the network (HTTP)."""
     if request.method == "GET":
         return current_club_selection()
     return apply_club_selection(request.get_json(silent=True))
@@ -3646,7 +3646,7 @@ def _finalize_shot_detected(
         except Exception as e:  # pylint: disable=broad-exception-caught
             logger.warning("[SERVER] Failed to queue BLE shot: %s", e, exc_info=True)
 
-    # Wi-Fi transport is likewise independent; a stalled client cannot affect
+    # The network transport is likewise independent; a stalled client cannot affect
     # shot recording or the browser UI.
     if shot_data is not None:
         try:
@@ -3792,7 +3792,7 @@ def _publish_phone_shot_v2(
     enrichment: dict | None,
 ) -> None:
     """Hand one v2 shot to the BLE and SSE phone transports; never raises."""
-    transports = [("Wi-Fi stream", shot_stream)]
+    transports = [("network stream", shot_stream)]
     if ble_publisher is not None:
         transports.append(("BLE", ble_publisher))
     for name, transport in transports:
@@ -3804,7 +3804,7 @@ def _publish_phone_shot_v2(
 
 def _publish_phone_event(event: dict) -> None:
     """Hand one schema v2 event to the BLE and SSE phone transports; never raises."""
-    transports = [("Wi-Fi stream", shot_stream)]
+    transports = [("network stream", shot_stream)]
     if ble_publisher is not None:
         transports.append(("BLE", ble_publisher))
     for name, transport in transports:

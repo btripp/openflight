@@ -4137,7 +4137,7 @@ class TestOnShotDetected:
         assert published[0]["ball_speed_mph"] == 100.0
 
     def test_shot_stream_publish_survives_websocket_failure(self, monkeypatch):
-        """A broken web client must not suppress the independent Wi-Fi transport."""
+        """A broken web client must not suppress the independent network transport."""
         broker = ShotStreamBroker()
         subscriber = broker.subscribe()
 

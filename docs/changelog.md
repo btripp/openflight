@@ -59,7 +59,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   when Node is older than 22.12 or `npm install` fails and `ui/dist` already
   exists). Installing Electron needs **Node.js 22.12 or newer**. See
   [Electron Kiosk Shell](electron-kiosk-shell.md).
-- **Phone transports: Bluetooth LE, a Wi-Fi shot stream and a club API.**
+- **Phone transports: Bluetooth LE, a network shot stream and a club API.**
   Ported from [jake-fishtech](https://github.com/jake-fishtech)'s `feat/iOS-ble`
   branch. `--ble` (with the optional `ble` extra, `bless==0.3.0` on Linux)
   advertises a GATT service that notifies each final shot and accepts versioned
@@ -77,7 +77,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   changes: Socket.IO `set_club` now ignores `unknown` and a missing club (it used
   to fall back to driver), and a failed Socket.IO shot emit no longer stops BLE,
   SSE and simulator delivery.
-- **BLE and Wi-Fi schema v2 for phone apps.** Version-one traffic is unchanged
+- **BLE and network schema v2 for phone apps.** Version-one traffic is unchanged
   byte for byte, so jake-fishtech's iOS app keeps working. v2 lives on a second
   shot/control characteristic pair in the same GATT service (BlueZ cannot notify
   one central but not another on a shared characteristic; see the design note in
@@ -91,8 +91,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `set_active_profile` and `get_power_status` through the same server functions
   Socket.IO uses. Because BLE is unauthenticated, v2 over Bluetooth is
   read-and-select only: clearing sessions, deleting shots and editing profiles
-  stay on Wi-Fi. `GET /api/shots/stream?schema=2` opts SSE clients
-  into the same events. BLE delivery now follows per-characteristic
+  stay on the network (Socket.IO/HTTP). `GET /api/shots/stream?schema=2` opts
+  SSE clients into the same events. BLE delivery now follows per-characteristic
   subscriptions, so the latest shot is replayed when a shot characteristic is
   subscribed and one phone unsubscribing no longer pauses the others. Tests run
   the real publisher against a loopback fake of Bless/BlueZ, and

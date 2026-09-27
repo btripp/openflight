@@ -49,7 +49,7 @@ def test_socket_set_club_without_monitor_still_broadcasts(no_monitor_transports)
     assert ble.clubs == ["7-iron"]
 
 
-def test_wifi_club_post_without_monitor_applies_and_broadcasts(no_monitor_transports):
+def test_network_club_post_without_monitor_applies_and_broadcasts(no_monitor_transports):
     stream, ble, emitted = no_monitor_transports
 
     response = server_module.app.test_client().post("/api/club", json={"club": "pw"})
@@ -63,7 +63,7 @@ def test_wifi_club_post_without_monitor_applies_and_broadcasts(no_monitor_transp
 
 
 @pytest.mark.parametrize("payload", [{"club": "putter"}, {"club": "unknown"}, {}, None, "pw"])
-def test_wifi_club_post_rejects_invalid_selection(no_monitor_transports, payload):
+def test_network_club_post_rejects_invalid_selection(no_monitor_transports, payload):
     stream, ble, emitted = no_monitor_transports
 
     response = server_module.app.test_client().post("/api/club", json=payload)

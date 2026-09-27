@@ -71,7 +71,7 @@ def test_apply_club_selection_rejects_unknown_club(monkeypatch):
     assert monitor.clubs == []
 
 
-def test_wifi_club_endpoint_uses_shared_selection_logic(monkeypatch):
+def test_network_club_endpoint_uses_shared_selection_logic(monkeypatch):
     monitor = _Monitor()
     monkeypatch.setattr(server_module, "monitor", monitor)
 
@@ -85,7 +85,7 @@ def test_wifi_club_endpoint_uses_shared_selection_logic(monkeypatch):
     assert monitor.clubs == [ClubType.PW]
 
 
-def test_wifi_club_endpoint_returns_authoritative_selection(monkeypatch):
+def test_network_club_endpoint_returns_authoritative_selection(monkeypatch):
     monkeypatch.setattr(server_module, "active_club", ClubType.WOOD_3)
 
     response = server_module.app.test_client().get("/api/club")
