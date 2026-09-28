@@ -14,7 +14,7 @@ from __future__ import annotations
 import logging
 import queue
 import threading
-from typing import Iterable, Iterator, Mapping
+from typing import Iterable, Iterator, Mapping, Sequence
 
 # The wire payload is the same versioned V1 shot event the BLE transport sends,
 # so both transports are validated against one contract and one test fixture.
@@ -22,10 +22,10 @@ from .ble.protocol import (
     SCHEMA_VERSION,
     SCHEMA_VERSION_V2,
     build_club_event_v2,
+    build_shot_event_v2,
     encode_club_event,
     encode_message_v2,
     encode_shot_event,
-    encode_shot_event_v2,
 )
 
 logger = logging.getLogger(__name__)
@@ -44,13 +44,19 @@ class ShotStreamFull(RuntimeError):
 
 
 class StreamEvent(bytes):
-    """Encoded JSON carrying its SSE name while remaining bytes-compatible."""
+    """Encoded JSON carrying its SSE name while remaining bytes-compatible.
+
+    v2 shots also carry their ``event_id`` as the SSE ``id``, so a client's
+    ``Last-Event-ID`` names the last shot it received (see ``phone_catch_up``).
+    """
 
     name: str
+    event_id: str | None
 
-    def __new__(cls, name: str, payload: bytes):
+    def __new__(cls, name: str, payload: bytes, event_id: str | None = None):
         event = super().__new__(cls, payload)
         event.name = name
+        event.event_id = event_id
         return event
 
 
@@ -61,7 +67,9 @@ def format_event(event: StreamEvent | bytes) -> str:
     needs to be split across multiple ``data:`` lines.
     """
     name = event.name if isinstance(event, StreamEvent) else "shot"
-    return f"event: {name}\ndata: {event.decode('utf-8')}\n\n"
+    event_id = event.event_id if isinstance(event, StreamEvent) else None
+    id_line = f"id: {event_id}\n" if event_id else ""
+    return f"event: {name}\n{id_line}data: {event.decode('utf-8')}\n\n"
 
 
 class ShotStreamBroker:
@@ -91,7 +99,7 @@ class ShotStreamBroker:
         # else keeps receiving the unchanged version-one stream.
         self._v2_subscribers: set[int] = set()
         self._latest_payload: bytes | None = None
-        self._latest_v2_payload: bytes | None = None
+        self._latest_v2_event: StreamEvent | None = None
 
     @property
     def subscriber_count(self) -> int:
@@ -124,15 +132,15 @@ class ShotStreamBroker:
     ) -> bool:
         """Send a provisional or final v2 shot to schema v2 subscribers."""
         try:
-            payload = encode_shot_event_v2(shot_data, final=final, enrichment=enrichment)
+            shot_event = build_shot_event_v2(shot_data, final=final, enrichment=enrichment)
+            event = StreamEvent("shot", encode_message_v2(shot_event), shot_event["event_id"])
         except (KeyError, TypeError, ValueError):
             logger.warning("[STREAM] Failed to encode v2 shot payload", exc_info=True)
             return False
 
         with self._lock:
-            self._latest_v2_payload = payload
+            self._latest_v2_event = event
             subscribers = self._subscribers_for(SCHEMA_VERSION_V2)
-        event = StreamEvent("shot", payload)
         for subscriber in subscribers:
             self._offer(subscriber, event)
         return True
@@ -174,11 +182,15 @@ class ShotStreamBroker:
         *,
         schema: int = SCHEMA_VERSION,
         initial_events: Iterable[Mapping] = (),
+        catch_up: Sequence[tuple[str, bytes]] | None = None,
     ) -> queue.Queue[StreamEvent]:
         """Register a subscriber, seeded with the latest shot for replay.
 
         A schema v2 subscriber is first seeded with ``initial_events`` (current
-        state such as club and profiles), then the latest v2 shot.
+        state such as club and profiles), then its ``catch_up`` shots
+        (``(event_id, payload)`` pairs, oldest first) or, when catch-up is
+        unavailable (``None``), the latest v2 shot. Version one ignores
+        ``catch_up``: its shots carry no stable id to resume from.
         """
         if schema not in (SCHEMA_VERSION, SCHEMA_VERSION_V2):
             raise ValueError(f"Unsupported shot stream schema: {schema}")
@@ -192,11 +204,15 @@ class ShotStreamBroker:
         with self._lock:
             if len(self._subscribers) >= self.max_subscribers:
                 raise ShotStreamFull(f"Shot stream already has {self.max_subscribers} clients")
-            latest = (
-                self._latest_v2_payload if schema == SCHEMA_VERSION_V2 else self._latest_payload
-            )
-            if latest is not None:
-                seed.append(StreamEvent("shot", latest))
+            if schema == SCHEMA_VERSION_V2 and catch_up is not None:
+                seed.extend(
+                    StreamEvent("shot", payload, event_id) for event_id, payload in catch_up
+                )
+            elif schema == SCHEMA_VERSION_V2:
+                if self._latest_v2_event is not None:
+                    seed.append(self._latest_v2_event)
+            elif self._latest_payload is not None:
+                seed.append(StreamEvent("shot", self._latest_payload))
             subscriber: queue.Queue[StreamEvent] = queue.Queue(
                 maxsize=max(self.queue_size, len(seed))
             )

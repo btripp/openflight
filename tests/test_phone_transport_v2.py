@@ -128,7 +128,19 @@ def test_unsupported_stream_schema_is_rejected():
 
 def test_v2_stream_route_opts_in_and_seeds_current_state(monkeypatch, tmp_path):
     broker = ShotStreamBroker(heartbeat_interval_s=0.01)
-    broker.publish_v2_shot(_shot_data(), final=True)
+    # The session, not the broker's latest shot, decides what a v2 client is
+    # seeded with (see tests/test_shot_stream_catch_up.py).
+    monitor = server_module.MockLaunchMonitor()
+    monitor._shots.append(
+        Shot(
+            ball_speed_mph=150.0,
+            timestamp=datetime(2026, 9, 25, 12, 0, 0, 1),
+            club=ClubType.DRIVER,
+            shot_number=1,
+        )
+    )
+    monkeypatch.setattr(server_module, "monitor", monitor)
+    monkeypatch.setattr(server_module, "phone_shot_cache", server_module.PhoneShotCache())
     monkeypatch.setattr(server_module, "shot_stream", broker)
     monkeypatch.setattr(server_module, "active_club", ClubType.IRON_7)
     monkeypatch.setattr(server_module, "power_monitor", None)

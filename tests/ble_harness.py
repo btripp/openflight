@@ -350,6 +350,7 @@ def server_loopback(monkeypatch, tmp_path):
     """
     from openflight import server as server_module  # pylint: disable=import-outside-toplevel
     from openflight.launch_monitor import ClubType  # pylint: disable=import-outside-toplevel
+    from openflight.phone_catch_up import PhoneShotCache  # pylint: disable=import-outside-toplevel
     from openflight.profiles import ProfileStore  # pylint: disable=import-outside-toplevel
     from openflight.shot_stream import ShotStreamBroker  # pylint: disable=import-outside-toplevel
 
@@ -376,11 +377,13 @@ def server_loopback(monkeypatch, tmp_path):
     monkeypatch.setattr(server_module, "debug_mode", False)
     monkeypatch.setattr(server_module, "sim_connectors", [])
     monkeypatch.setattr(server_module, "get_session_logger", lambda: None)
+    monkeypatch.setattr(server_module, "phone_shot_cache", PhoneShotCache())
 
     loopback = BleLoopback(
         monkeypatch,
         command_handler=server_module.dispatch_phone_control_command,
         command_handler_v2=server_module.dispatch_phone_control_command_v2,
+        catch_up_provider=server_module.phone_catch_up_v2,
     )
     with loopback:
         monkeypatch.setattr(server_module, "ble_publisher", loopback.publisher)

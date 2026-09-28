@@ -60,6 +60,7 @@ V2_FEATURES = (
     "power_status",
     "shot_deleted",
     "club",
+    "shot_catch_up",
 )
 
 V2_EVENT_TYPES = (

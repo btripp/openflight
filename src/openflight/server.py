@@ -32,6 +32,8 @@ from .ble.protocol import (
     build_session_cleared_event,
     build_shot_deleted_event,
     build_shot_processing_event,
+    encode_shot_event_v2,
+    stable_shot_event_id,
 )
 from .clubs import ClubType
 from .clubs.physics import (
@@ -47,6 +49,7 @@ from .ops243 import (
     SpeedReading,
     set_show_raw_readings,
 )
+from .phone_catch_up import PhoneShotCache, normalize_last_event_id, select_catch_up
 from .phone_orientation import (
     PhoneOrientationMeasurement,
     PhoneOrientationValidationError,
@@ -189,6 +192,10 @@ club_selection_lock = threading.Lock()
 # shots the browser UI already broadcasts over WebSocket, so it adds no reach
 # beyond the existing HTTP server.
 shot_stream = ShotStreamBroker()
+
+# The exact v2 bytes last sent per shot, so a reconnecting phone's catch-up
+# (BLE and network alike) replays what it would have received live.
+phone_shot_cache = PhoneShotCache()
 
 shutdown_lock = threading.Lock()
 shutdown_cleanup_started = False
@@ -1753,18 +1760,36 @@ def handle_get_camera_capture_settings():
     socketio.emit("camera_capture_settings", _camera_capture_settings_payload())
 
 
+def _stream_catch_up_v2(last_event_id) -> list[tuple[str, bytes]] | None:
+    """Catch-up for a v2 stream client, or ``None`` (latest-shot replay) on failure."""
+    try:
+        return phone_catch_up_v2(last_event_id)
+    except Exception:  # pylint: disable=broad-exception-caught
+        logger.warning("[SERVER] Could not load missed shots for the stream", exc_info=True)
+        return None
+
+
 @app.route("/api/shots/stream")
 def shots_stream():
     """Stream completed shots to phones as Server-Sent Events.
 
     ``?schema=2`` opts into schema v2 events; the default stays version one.
+    A v2 client resumes with ``Last-Event-ID`` (or ``?last_event_id=``) and is
+    seeded with the session shots it missed, as BLE ``hello`` does.
     """
     schema_arg = request.args.get("schema", "1")
     if schema_arg not in ("1", "2"):
         return {"error": "Unsupported schema; use 1 or 2"}, 400
     try:
         if schema_arg == "2":
-            subscriber = shot_stream.subscribe(schema=2, initial_events=_phone_state_events_v2())
+            last_event_id = request.headers.get("Last-Event-ID") or request.args.get(
+                "last_event_id"
+            )
+            subscriber = shot_stream.subscribe(
+                schema=2,
+                initial_events=_phone_state_events_v2(),
+                catch_up=_stream_catch_up_v2(last_event_id),
+            )
         else:
             subscriber = shot_stream.subscribe()
     except ShotStreamFull as exc:
@@ -3792,6 +3817,13 @@ def _publish_phone_shot_v2(
     enrichment: dict | None,
 ) -> None:
     """Hand one v2 shot to the BLE and SSE phone transports; never raises."""
+    try:
+        phone_shot_cache.remember(
+            stable_shot_event_id(shot_data),
+            encode_shot_event_v2(shot_data, final=final, enrichment=enrichment),
+        )
+    except (KeyError, TypeError, ValueError):
+        logger.warning("[SERVER] Could not cache v2 shot for phone catch-up", exc_info=True)
     transports = [("network stream", shot_stream)]
     if ble_publisher is not None:
         transports.append(("BLE", ble_publisher))
@@ -3800,6 +3832,31 @@ def _publish_phone_shot_v2(
             transport.publish_v2_shot(shot_data, final=final, enrichment=enrichment)
         except Exception:  # pylint: disable=broad-exception-caught
             logger.warning("[SERVER] Failed to queue v2 shot over %s", name, exc_info=True)
+
+
+def phone_catch_up_v2(last_event_id=None) -> list[tuple[str, bytes]]:
+    """The current-session v2 shots a reconnecting phone missed, oldest first.
+
+    Shared by BLE ``hello`` and the network stream's ``Last-Event-ID``; see
+    ``openflight.phone_catch_up`` for the rule. The session decides which
+    shots exist, so cleared and deleted shots are never replayed. A shot is
+    replayed as the bytes last published for it, or rebuilt as a final shot
+    when that is no longer cached.
+    """
+    session = monitor
+    if session is None or not hasattr(session, "get_shots"):
+        return []
+    entries = []
+    for shot in session.get_shots():
+        try:
+            shot_data = shot_to_dict(shot)
+            event_id = stable_shot_event_id(shot_data)
+            payload = phone_shot_cache.get(event_id) or encode_shot_event_v2(shot_data, final=True)
+        except (AttributeError, KeyError, TypeError, ValueError):
+            logger.warning("[SERVER] Skipped a shot that could not be replayed", exc_info=True)
+            continue
+        entries.append((event_id, payload))
+    return select_catch_up(entries, normalize_last_event_id(last_event_id))
 
 
 def _publish_phone_event(event: dict) -> None:
@@ -5422,6 +5479,7 @@ def main():
         ble_publisher = BleShotPublisher(
             command_handler=dispatch_phone_control_command,
             command_handler_v2=dispatch_phone_control_command_v2,
+            catch_up_provider=phone_catch_up_v2,
         )
         ble_publisher.start()
         print("Bluetooth LE enabled (advertising as OpenFlight)")
