@@ -22,6 +22,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   [Electron Kiosk Shell](electron-kiosk-shell.md#browser-local-state-breaking-on-first-electron-launch).
 
 ### Fixed
+- **iPhones no longer get a pairing prompt every 30 s over BLE.** BlueZ's own
+  GATT client read the phone's GATT database, iOS answered "Insufficient
+  Authentication", and BlueZ requested pairing that no agent on the Pi could
+  confirm, so the link dropped after the 30 s SMP timeout and looped. New
+  `scripts/setup/configure_bluetooth.sh` (offered by `setup.sh`) sets
+  `Client = false` under `[GATT]` in `/etc/bluetooth/main.conf`, with a
+  backup and a bluetooth restart. See
+  [Troubleshooting](ios-ble.md#troubleshooting).
 - **A crash-looping boot service no longer kills the desktop kiosk.** Every
   launcher exit ran a `pkill` that matched the Electron binary path, so an
   `openflight.service` that failed at startup (for example because systemd's

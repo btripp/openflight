@@ -44,10 +44,13 @@ installations:
 ./scripts/setup/setup.sh
 ```
 
-For an existing checkout, install it and start OpenFlight with BLE enabled:
+For an existing checkout, install it, configure BlueZ once so iOS does not keep
+prompting to pair (see [Troubleshooting](#troubleshooting)), and start
+OpenFlight with BLE enabled:
 
 ```bash
 uv sync --extra ble
+./scripts/setup/configure_bluetooth.sh
 scripts/start-kiosk.sh --ble
 ```
 
@@ -526,6 +529,38 @@ and coexistence with SSE and Socket.IO clients.
 - Run `bluetoothctl show` on the Pi and confirm `Powered: yes`.
 - Keep the app in the foreground for the initial connection.
 - Restart OpenFlight after changing the Pi Bluetooth configuration.
+
+**The iPhone shows a pairing prompt every 30 seconds.**
+
+Symptom: the phone connects, then disconnects about every 33 seconds and iOS
+asks to pair again. The OpenFlight log shows `[BLE] Client subscribed (schema
+v2)` followed by `unsubscribed` exactly 30 seconds later, and `bluetoothctl info
+<phone>` shows `Paired: no`.
+
+OpenFlight never asks for pairing. BlueZ does: by default `bluetoothd` also acts
+as a GATT client and reads the phone's own GATT database. The iPhone answers
+`Insufficient Authentication`, BlueZ sends an SMP Security Request (the iOS
+prompt), and nothing on a headless or kiosk Pi confirms the pairing. After the
+30-second SMP timeout BlueZ disconnects with `Authentication Failure (0x05)`,
+the phone reconnects, and the loop repeats.
+
+Turn off BlueZ's GATT client role (OpenFlight only needs to be a peripheral):
+
+```bash
+./scripts/setup/configure_bluetooth.sh          # or --check to only report
+```
+
+The script backs up `/etc/bluetooth/main.conf`, sets `Client = false` under
+`[GATT]`, and restarts bluetooth. Restart OpenFlight afterwards so its BLE
+server re-registers, and on the iPhone tap Forget This Device if iOS remembered
+a half-finished pairing. `setup.sh` offers this step on a Pi.
+
+Set the key under `[GATT]`. Stock `main.conf` on Raspberry Pi OS lists the
+commented `#Client = true` under `[CSIS]`, where `bluetoothd` ignores it.
+
+To confirm the fix, capture with `sudo btmon` while the phone connects: there
+should be no `SMP: Security Request` and no `Disconnect … Authentication
+Failure`, and the subscription should stay up past 30 seconds.
 
 **The Pi logs `DBusError: Failed to register advertisement`.**
 
