@@ -106,6 +106,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the real publisher against a loopback fake of Bless/BlueZ, and
   `tests/fixtures/ble_goldens/` holds framed hex goldens for client test suites
   (`scripts/ble/generate_goldens.py`).
+- **Phones catch up on missed shots after a reconnect (schema v2).** A phone
+  that left the app or dropped the link used to get only the latest shot back.
+  Now `hello` accepts `last_event_id` over BLE, and the v2 network stream honours
+  `Last-Event-ID` (or `?last_event_id=`); both resend that shot and every
+  current-session shot after it, up to 20, with the whole session when no shot
+  is named. Cleared and deleted shots are never replayed, replays carry the
+  bytes last sent live, and v2 network `shot` frames now include `id:`. `hello`
+  advertises the `shot_catch_up` feature; the `hello` goldens changed only by
+  that entry. Apps that skip `last_event_id` receive the whole session and
+  upsert it by `event_id`. See
+  [catch-up](ios-ble.md#catch-up-after-a-reconnect).
 - **PAR-TEE connector.** `"type": "partee"` in `config/sim.json` streams shots
   to the [PAR-TEE](https://playpartee.com) iPhone app over OpenConnect V1 on the
   phone's Wi-Fi address (port 921 by default). Same shared codec as GSPro and

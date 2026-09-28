@@ -316,15 +316,20 @@ message.
 
 1. Discover the service. If the v2 characteristics are missing, the Pi is
    version one: use the v1 pair.
-2. Subscribe to the v2 control characteristic and write `hello`:
+2. Subscribe to the v2 control characteristic and write `hello`. Add
+   `last_event_id`, the `event_id` of the newest shot the app already has, to
+   [catch up](#catch-up-after-a-reconnect) on shots missed while disconnected;
+   leave it out on a first connection:
    ```json
-   {"payload":{"client_schema_max":2},"request_id":"<uuid>","schema_version":2,"type":"hello"}
+   {"payload":{"client_schema_max":2,"last_event_id":"05dd37ec-49ed-596b-b1a4-953d54e4f239"},"request_id":"<uuid>","schema_version":2,"type":"hello"}
    ```
    The result names the negotiated schema, the features and the v2 pair:
    ```json
-   {"ok":true,"request_id":"<uuid>","result":{"characteristics":{"control":"7BA96E63-12C2-4CE0-BB84-3513C7FD1474","shot":"ED365FE6-3ABF-4FC3-8E44-D9525A22DABD"},"features":["provisional_shots","shot_processing","profiles","power_status","shot_deleted","club"],"schema_version":2},"schema_version":2}
+   {"ok":true,"request_id":"<uuid>","result":{"characteristics":{"control":"7BA96E63-12C2-4CE0-BB84-3513C7FD1474","shot":"ED365FE6-3ABF-4FC3-8E44-D9525A22DABD"},"features":["provisional_shots","shot_processing","profiles","power_status","shot_deleted","club","shot_catch_up"],"schema_version":2},"schema_version":2}
    ```
-3. Subscribe to the v2 shot characteristic. The latest v2 shot is replayed.
+3. Subscribe to the v2 shot characteristic. The catch-up shots arrive. A client
+   that skipped `hello` gets only the latest v2 shot, as before catch-up
+   existed.
 4. Ask for state: `get_club`, `get_profiles` and, if wanted, `get_power_status`.
 
 `hello` also works on the v1 control characteristic, in a v1 envelope
@@ -334,6 +339,49 @@ the same. An older Pi answers `ok:false` with
 as version one. `client_schema_max: 1` returns `{"schema_version":1,"features":[]}`.
 The v2 control characteristic accepts envelopes with `schema_version` 1 or 2
 and always answers with `schema_version: 2`.
+
+### Catch-up after a reconnect
+
+A phone that leaves the app, walks out of range or loses the network misses the
+shots taken meanwhile. Schema v2 catches it up on reconnect, with one rule for
+both transports:
+
+| | BLE | Network |
+|---|---|---|
+| Name the newest shot you have | `last_event_id` in the `hello` payload | `Last-Event-ID` request header, or `?last_event_id=` (the header wins) |
+| Catch-up arrives | On the v2 shot characteristic, after the `hello` response; held until the phone subscribes to it | Seeded after the state events, before live events |
+| Without catch-up | A client that skips `hello` gets the latest v2 shot | — (every v2 connection gets catch-up) |
+
+- The Pi sends the named shot again, then every current-session shot after
+  it, oldest first. Resending the named shot means a phone that only had its
+  provisional version (it disconnected before the final arrived) ends up with
+  the final.
+- No `last_event_id`, or one the session no longer holds (the session was
+  cleared, that shot was deleted, or the Pi restarted), means the whole
+  current session.
+- At most the 20 most recent shots are sent. Use `shot_number` gaps to tell
+  that older shots were not synced (deleted shots also leave gaps).
+- Replayed shots are the exact bytes last sent live, including `final` and
+  `enrichment`. A shot no longer cached is rebuilt as a final shot with
+  `enrichment: null`.
+- Cleared and deleted shots are never replayed: the Pi's session decides what
+  exists.
+- Upsert by `event_id` as for live shots; replays of shots the app already has
+  are harmless. Invalid `last_event_id` values are treated as absent and never
+  fail `hello`.
+- Every network v2 `shot` frame carries `id: <event_id>`, so an `EventSource`
+  resends `Last-Event-ID` on its own when it reconnects. Other events carry no
+  `id`, which leaves the last shot id in place. Version-one streams and the v1
+  characteristics have no catch-up: their `event_id` is not stable.
+- Over BLE a notification reaches every subscribed phone, so another connected
+  phone receives the catch-up too and upserts it.
+- A shot taken while a BLE catch-up is still being sent can push the oldest
+  queued catch-up shot out of the eight-message delivery queue. The phone then
+  lacks that one shot until its session is replayed in full (for example after
+  it reconnects without `last_event_id`).
+
+The Pi advertises support with the `shot_catch_up` feature in the `hello`
+result. An older Pi ignores `last_event_id` and only replays the latest shot.
 
 ### v2 shot
 
@@ -420,7 +468,9 @@ commands sent there fail with `Unsupported phone command`.
 v2. The default (no parameter, or `schema=1`) is the unchanged version-one
 stream; any other value returns `400`. A v2 stream opens with `: ping`, then
 the current state as `club_changed`, `profiles` and (with a battery monitor)
-`power_status`, then the latest v2 shot. Event names match the `type` of the
+`power_status`, then the [catch-up](#catch-up-after-a-reconnect) shots
+(the whole session unless `Last-Event-ID` names a shot). Each `shot` frame
+carries `id: <event_id>`. Event names match the `type` of the
 payload: `shot`, `shot_processing`, `profiles`, `power_status`,
 `session_cleared`, `shot_deleted` and `club_changed`. Commands stay on `/api/club`, the
 calibration route and Socket.IO.
@@ -444,8 +494,9 @@ message that would not fit instead of sending a truncated one.
 - Each connected client gets a bounded queue of eight unsent events; the oldest
   queued event is dropped if that client cannot keep up. One stalled phone
   cannot slow down another.
-- Disconnecting clears that client's queue but retains the latest completed shot
-  for replay on the next connection.
+- Disconnecting clears that client's queue. On the next connection a v2 client
+  is [caught up](#catch-up-after-a-reconnect) on the session shots it missed
+  (up to 20); a version-one client gets the latest completed shot replayed.
 - The iOS app ignores a replayed event when its `event_id` is already visible.
   v2 clients upsert by `event_id`, which also merges a provisional shot with
   its final version.
@@ -499,7 +550,9 @@ Bluetooth adapter or `bless` install:
 uv run pytest tests/test_ble_protocol.py tests/test_ble_protocol_v2.py \
   tests/test_ble_publisher.py tests/test_ble_loopback.py tests/test_ble_goldens.py \
   tests/test_shot_stream.py tests/test_phone_transport_server.py \
-  tests/test_phone_transport_v2.py tests/test_control_commands.py -v
+  tests/test_phone_transport_v2.py tests/test_control_commands.py \
+  tests/test_phone_catch_up.py tests/test_ble_catch_up.py \
+  tests/test_shot_stream_catch_up.py -v
 uv run python scripts/ble/generate_goldens.py --check
 ```
 
